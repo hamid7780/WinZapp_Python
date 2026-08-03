@@ -275,13 +275,24 @@ export function createRouter(manager: BaileysManager): Router {
   });
 
   // List Chats
-  router.all(['/api/:session/list-chats', '/api/:session/all-contacts'], authCheck, (req: Request, res: Response) => {
-    return res.status(200).json({ status: 'SUCCESS', response: [] });
+  router.all('/api/:session/list-chats', authCheck, (req: Request, res: Response) => {
+    const { session } = req.params;
+    const chats = manager.getChats(session);
+    return res.status(200).json({ status: 'SUCCESS', response: chats });
+  });
+
+  // All Contacts
+  router.all('/api/:session/all-contacts', authCheck, (req: Request, res: Response) => {
+    const { session } = req.params;
+    const contacts = manager.getContacts(session);
+    return res.status(200).json({ status: 'SUCCESS', response: contacts });
   });
 
   // Get Messages
   router.get('/api/:session/get-messages/:phone', authCheck, (req: Request, res: Response) => {
-    return res.status(200).json({ status: 'SUCCESS', response: [] });
+    const { session, phone } = req.params;
+    const msgs = manager.getMessages(session, phone);
+    return res.status(200).json({ status: 'SUCCESS', response: msgs });
   });
 
   return router;

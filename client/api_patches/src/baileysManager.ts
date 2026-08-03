@@ -500,12 +500,159 @@ export class BaileysManager {
     return await sock.groupCreate(groupName, jids);
   }
 
-  public normalizeJid(phone: string): string {
+  public getChats(sessionRaw: string): any[] {
+    const session = this.getSafeSessionName(sessionRaw);
+    const store = this.stores.get(session);
+    const chats: any[] = [];
+    const seenJids = new Set<string>();
+
+    if (store && store.chats) {
+      const allChats = store.chats.all();
+      for (const c of allChats) {
+        if (!c.id || c.id === 'status@broadcast') continue;
+        const jid = this.normalizeJid(c.id);
+        if (seenJids.has(jid)) continue;
+        seenJids.add(jid);
+
+        const contact = (store.contacts && store.contacts[c.id]) || (store.contacts && store.contacts[jid]) || {};
+        const isGroup = jid.endsWith('@g.us');
+        const name = c.name || (c as any).subject || contact.name || contact.notify || jid.split('@')[0];
+
+        chats.push({
+          id: { _serialized: jid },
+          remoteJid: jid,
+          name: name,
+          pushName: contact.notify || contact.name || '',
+          unreadCount: c.unreadCount || 0,
+          isGroup: isGroup,
+          timestamp: c.conversationTimestamp || Math.floor(Date.now() / 1000)
+        });
+      }
+    }
+
+    if (store && store.messages) {
+      for (const jidKey in store.messages) {
+        if (!jidKey || jidKey === 'status@broadcast') continue;
+        const jid = this.normalizeJid(jidKey);
+        if (seenJids.has(jid)) continue;
+        seenJids.add(jid);
+
+        const contact = (store.contacts && store.contacts[jidKey]) || (store.contacts && store.contacts[jid]) || {};
+        const isGroup = jid.endsWith('@g.us');
+        const name = contact.name || contact.notify || jid.split('@')[0];
+
+        chats.push({
+          id: { _serialized: jid },
+          remoteJid: jid,
+          name: name,
+          pushName: contact.notify || contact.name || '',
+          unreadCount: 0,
+          isGroup: isGroup,
+          timestamp: Math.floor(Date.now() / 1000)
+        });
+      }
+    }
+
+    return chats;
+  }
+
+  public getContacts(sessionRaw: string): any[] {
+    const session = this.getSafeSessionName(sessionRaw);
+    const store = this.stores.get(session);
+    const contacts: any[] = [];
+
+    if (store && store.contacts) {
+      for (const id in store.contacts) {
+        if (!id || id.endsWith('@g.us') || id === 'status@broadcast') continue;
+        const c = store.contacts[id];
+        const jid = this.normalizeJid(id);
+
+        contacts.push({
+          id: { _serialized: jid },
+          name: c.name || c.notify || jid.split('@')[0],
+          pushname: c.notify || c.name || '',
+          number: jid.split('@')[0]
+        });
+      }
+    }
+
+    return contacts;
+  }
+
+  public getMessages(sessionRaw: string, phoneInput: any): any[] {
+    const session = this.getSafeSessionName(sessionRaw);
+    const store = this.stores.get(session);
+    const jid = this.normalizeJid(phoneInput);
+    if (!store || !store.messages) return [];
+
+    const rawMsgs = store.messages[jid] || store.messages[jid.replace('@s.whatsapp.net', '@c.us')] || [];
+    const formatted: any[] = [];
+
+    if (Array.isArray(rawMsgs)) {
+      for (const m of rawMsgs) {
+        if (m && m.message) {
+          formatted.push(this.formatWppMessage(m));
+        }
+      }
+    } else if (rawMsgs && typeof rawMsgs === 'object') {
+      const msgsArr = (rawMsgs as any).array || Object.values(rawMsgs);
+      for (const m of msgsArr) {
+        if (m && (m as any).message) {
+          formatted.push(this.formatWppMessage(m as WAMessage));
+        }
+      }
+    }
+
+    return formatted;
+  }
+
+  public async sendMentioned(sessionRaw: string, phoneInput: any, text: string, mentionedJids: string[] = []): Promise<any> {
+    const session = this.getSafeSessionName(sessionRaw);
+    const sock = this.sessions.get(session);
+    if (!sock) throw new Error('Session not connected');
+
+    const jid = this.normalizeJid(phoneInput);
+    const mentions = (mentionedJids || []).map((m) => this.normalizeJid(m));
+
+    const sent = await sock.sendMessage(jid, { text, mentions });
+    const msgId = sent?.key?.id || '';
+    const serializedId = `true_${jid}_${msgId}`;
+
+    return [{
+      id: { _serialized: serializedId, id: msgId, fromMe: true, remote: jid },
+      from: sock.user?.id || '',
+      to: jid,
+      fromMe: true,
+      type: 'chat',
+      body: text,
+      timestamp: sent?.messageTimestamp || Math.floor(Date.now() / 1000)
+    }];
+  }
+
+  public normalizeJid(phoneInput: any): string {
+    if (!phoneInput) return '';
+    let phone = Array.isArray(phoneInput) ? phoneInput[0] : String(phoneInput);
     if (!phone) return '';
+
+    phone = phone.trim();
     if (phone.endsWith('@g.us') || phone.endsWith('@s.whatsapp.net')) {
       return phone;
     }
-    const clean = phone.replace(/[^0-9]/g, '');
+    if (phone.endsWith('@c.us')) {
+      let cleanNum = phone.replace('@c.us', '').replace(/[^0-9]/g, '');
+      if (cleanNum.startsWith('920')) {
+        cleanNum = '92' + cleanNum.slice(3);
+      }
+      return `${cleanNum}@s.whatsapp.net`;
+    }
+    if (phone.endsWith('@lid')) {
+      return this.lidToPhoneMap.get(phone) || phone;
+    }
+
+    let clean = phone.replace(/[^0-9]/g, '');
+    if (clean.startsWith('920')) {
+      clean = '92' + clean.slice(3);
+    }
     return `${clean}@s.whatsapp.net`;
   }
 
