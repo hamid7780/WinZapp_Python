@@ -5136,6 +5136,11 @@ class MainWindow(wx.Frame):
                         "[check_wa_connection_http] Session is in active state '%s' — skipping /start-session to avoid browser conflict.",
                         status,
                     )
+                    if status in ("INITIALIZING", "STARTING", "PAIRED", "inChat"):
+                        try:
+                            wx.CallLater(1000, self.check_wa_connection_http)
+                        except Exception:
+                            pass
                     if status in ("notLogged", "QRCODE"):
                         self._wa_connected = False
 

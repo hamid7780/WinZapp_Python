@@ -40,6 +40,7 @@ server.listen(port, () => {
 
 io.on('connection', (socket) => {
   console.log(`[Socket.IO] Python client connected: ${socket.id}`);
+  manager.onClientConnected(socket);
   socket.on('disconnect', () => {
     console.log(`[Socket.IO] Python client disconnected: ${socket.id}`);
   });

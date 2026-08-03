@@ -116,6 +116,28 @@ class BaileysManager {
         const cleanLid = lid.replace('@c.us', '@s.whatsapp.net');
         return this.lidToPhoneMap.get(cleanLid) || this.lidToPhoneMap.get(lid);
     }
+    onClientConnected(socket) {
+        console.log(`[BaileysManager] Resending state for active sessions to socket ${socket.id}`);
+        for (const [session, status] of this.sessionStatus.entries()) {
+            if (status === 'CONNECTED') {
+                const sock = this.sessions.get(session);
+                const userJid = sock?.user?.id ? this.normalizeJid(sock.user.id) : '';
+                const connPayload = {
+                    session,
+                    state: 'open',
+                    data: {
+                        state: 'open',
+                        wuid: userJid,
+                        phoneNumber: userJid
+                    }
+                };
+                socket.emit('connection.update', connPayload);
+                socket.emit('session-logged', { status: true, session, data: connPayload.data });
+                socket.emit('status-find', { status: 'CONNECTED', session });
+                socket.emit('messages.set', { session });
+            }
+        }
+    }
     async startSession(sessionRaw, phone) {
         const session = this.getSafeSessionName(sessionRaw);
         const existingSock = this.sessions.get(session);
