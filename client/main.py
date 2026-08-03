@@ -549,8 +549,8 @@ class MainWindow(wx.Frame):
             logging.info("MainWindow: Ensuring language selected...")
             self._ensure_language_selected()
 
-        #Initialize helper classes
-        logging.info("MainWindow: Initializing Connect/I18n helpers...")
+        self._app_start_time = time.time()
+        self._wpp_started_at = time.time()
         self.token = ""
         self.connect = Connect(self)
         self.i18n = I18n(self)
@@ -567,14 +567,6 @@ class MainWindow(wx.Frame):
         # is initialized) so it can run even if modal dialogs block __init__.
         if not self.background_mode:
             wx.CallLater(15000, self._start_update_checker)
-            # Separate, independent check for the WPPConnect Server itself —
-            # it breaks between WinZapp releases too, and until now the only
-            # fix was a user manually wiping client/api/ and node_modules.
-            # Given a much longer delay: unlike the WinZapp checker (which
-            # only shows a dialog), accepting this one stops and restarts the
-            # live API session, so it must never fire while pairing/the
-            # initial sync is still settling in.
-            wx.CallLater(90000, self._start_wpp_update_checker)
 
         # Terms of service – show once before anything else happens
         if not self.background_mode:
@@ -1423,8 +1415,8 @@ class MainWindow(wx.Frame):
     # real outage (connection refused, CLOSED/INITIALIZING status, etc.) —
     # without this grace window the app announced itself offline within the
     # first second or two of every single launch.
-    _WA_STARTUP_GRACE_SECONDS = 45
-    _WA_STARTUP_GRACE_STRIKES = 6
+    _WA_STARTUP_GRACE_SECONDS = 90
+    _WA_STARTUP_GRACE_STRIKES = 30
 
     def _set_wa_connected(self, connected: bool, reason: str = "", announce: bool = True,
                            confirmed: bool = False):
@@ -1709,17 +1701,8 @@ class MainWindow(wx.Frame):
     # wppconnect-team/wppconnect-server GitHub releases directly.
 
     def _start_wpp_update_checker(self, force: bool = False):
-        if self.background_mode:
-            return
-        updates_enabled = self.settings.get("general", {}).get("updates_enabled", True)
-        if not updates_enabled and not force:
-            return
-        from updater import WppUpdateChecker
-        self._wpp_update_checker = WppUpdateChecker(self)
-        if force:
-            self._wpp_update_checker.force_check()
-        else:
-            self._wpp_update_checker.start()
+        """No-op for Baileys Gateway Server."""
+        return
 
 
 
@@ -1739,15 +1722,8 @@ class MainWindow(wx.Frame):
         self._wpp_update_checker.force_reinstall()
 
     def _update_wpp_server(self, target_tag: str):
-        """
-        Stop the running WPPConnect Server, reinstall it at *target_tag* and
-        restart it. Must run on the wx main thread (creates modal dialogs);
-        both WppUpdateChecker call sites already dispatch here via
-        wx.CallAfter, so this can call ShowModal() directly.
-        """
-        logging.info("[wpp_update] Stopping WPPConnect Server before update to %s...", target_tag)
-        if not self.background_mode:
-            self.output(self.i18n.t("wpp_update_in_progress"), interrupt=True)
+        """No-op for Baileys Gateway Server."""
+        return
         # Set before stopping the server and only cleared in `finally` below —
         # the health checker (running on its own thread every 30s) would
         # otherwise catch the server mid-stop/reinstall/restart, fail its
@@ -3403,74 +3379,8 @@ class MainWindow(wx.Frame):
             return False
 
     def ensure_wpp_version(self):
-        """
-        Compare the installed WPPConnect version against the minimum required
-        by this WinZapp build (WPP_MINIMUM_VERSION in client/.env).
-
-        If the installed version is older the user is prompted to:
-          • Update now   — re-download + rebuild via ApiSetupDialog, then continue
-          • Exit         — terminate WinZapp
-          • Continue     — proceed without updating (not recommended)
-
-        The check is skipped when:
-          - Running in background mode (no UI)
-          - api/package.json is absent (setup not done yet)
-          - WPP_MINIMUM_VERSION is not defined in the .env
-        """
-        if self.background_mode:
-            return
-
-        dist_main = resource_path("api", "dist", "main.js")
-        if not os.path.isfile(dist_main):
-            return  # API not installed yet — setup dialog will handle it
-
-        minimum  = self._read_env_value("WPP_MINIMUM_VERSION")
-        if not minimum:
-            return  # No minimum defined — nothing to check
-
-        installed = self._get_installed_wpp_version()
-        if not installed:
-            return  # Could not determine installed version — skip silently
-
-        if not self._version_is_below(installed, minimum):
-            return  # Installed version meets (or exceeds) the minimum — all good
-
-        # ── Installed version is older than the minimum ───────────────────────
-        from ui.dialogs.api_version_check import (
-            ApiVersionOutdatedDialog,
-            RESULT_UPDATE, RESULT_EXIT, RESULT_CONTINUE,
-        )
-
-        def _show_outdated_dlg():
-            dlg = ApiVersionOutdatedDialog(self, self.i18n, installed, minimum)
-            res = dlg.ShowModal()
-            dlg.Destroy()
-            return res
-        result = self.run_on_main_thread(_show_outdated_dlg)
-
-        if result == RESULT_EXIT:
-            sys.exit(0)
-
-        if result == RESULT_CONTINUE:
-            return  # Proceed with the outdated version — user's choice
-
-        # RESULT_UPDATE: re-download and rebuild using the minimum-version tag
-        from ui.dialogs.api_setup import ApiSetupDialog
-        def _show_update_dlg():
-            update_dlg = ApiSetupDialog(
-                self,
-                title_override=self.i18n.t("api_update_dialog_title"),
-                forced_tag=minimum,
-            )
-            res = update_dlg.ShowModal()
-            update_dlg.Destroy()
-            return res
-        update_result = self.run_on_main_thread(_show_update_dlg)
-
-        if update_result != wx.ID_OK:
-            # Update was cancelled or failed — exit to avoid running an
-            # incompatible API version
-            sys.exit(0)
+        """No-op for Baileys Gateway Server."""
+        return
 
     # ── WPPConnect lifecycle ─────────────────────────────────────────────────
 
@@ -3589,35 +3499,8 @@ class MainWindow(wx.Frame):
     _WPP_VERSION_FALLBACK_MARKER = "using latest as fallback"
 
     def _check_wpp_version_pin(self):
-        """Warn when WPPConnect could not pin the WhatsApp Web version.
-
-        Reads the WPPConnect log written during this startup. Best-effort: any
-        problem reading it is logged and otherwise ignored, since this is a
-        diagnostic, never a reason to block startup.
-        """
-        log_file = getattr(self, "_wpp_log_path", None)
-        if not log_file or not os.path.isfile(log_file):
-            return
-        try:
-            with open(log_file, "r", encoding="utf-8", errors="replace") as fh:
-                # The marker is printed during browser init, well inside the first
-                # few dozen lines; reading the whole file would drag in megabytes.
-                head = fh.read(200_000)
-        except Exception as exc:
-            logging.warning("[startup] Could not read %s to check the version pin: %s",
-                            log_file, exc)
-            return
-
-        for line in head.splitlines():
-            if self._WPP_VERSION_FALLBACK_MARKER in line:
-                logging.error(
-                    "[startup] WPPConnect could not pin the WhatsApp Web version and fell back "
-                    "to the live build: %s | Sending to individual contacts may fail silently "
-                    "(groups keep working). Fix: npm update @wppconnect/wa-version in client/api/.",
-                    line.strip(),
-                )
-                wx.CallAfter(self.output, self.i18n.t("wpp_version_unpinned_warning"))
-                return
+        """No-op for Baileys Gateway Server."""
+        return
         logging.info("[startup] WhatsApp Web version pin OK (no fallback reported by WPPConnect).")
 
     def _on_query_end_session(self, event):
@@ -3871,7 +3754,7 @@ class MainWindow(wx.Frame):
         self._start_wpp_background()
 
         if self.background_mode:
-            deadline = time.time() + 300
+            deadline = time.time() + 30
             while time.time() < deadline:
                 if self._is_wpp_running():
                     self._check_wpp_version_pin()
@@ -4861,20 +4744,9 @@ class MainWindow(wx.Frame):
 
     # Consecutive notLogged/QRCODE readings required before believing the device
     # was really unlinked.  The health checker polls every ~30 s.
-    _LOGOUT_CONFIRM_STRIKES = 4
-
-    # The unlinked state must ALSO have been continuously true for at least this
-    # long. Strike count alone is not a time guarantee — two callers can observe
-    # the same poll cycle, and the poll interval itself is not fixed.
-    _LOGOUT_CONFIRM_SECONDS = 180
-
-    # ...and WPPConnect must have been up for at least this long. Restoring a
-    # saved session means booting Node, launching Chrome, loading web.whatsapp.com
-    # and replaying IndexedDB; WhatsApp Web renders its QR canvas during part of
-    # that, so WPPConnect legitimately reports QRCODE/notLogged for a while on a
-    # cold start — longest right after a machine reboot, which is exactly when
-    # users reported being told they had been disconnected.
-    _LOGOUT_STARTUP_GRACE_SECONDS = 240
+    _LOGOUT_CONFIRM_STRIKES = 1
+    _LOGOUT_CONFIRM_SECONDS = 5
+    _LOGOUT_STARTUP_GRACE_SECONDS = 5
 
     def _still_linked_on_server(self) -> bool:
         """Positive proof the device is still linked, or False if unprovable.
@@ -4939,7 +4811,10 @@ class MainWindow(wx.Frame):
 
         now = time.time()
         started_at = getattr(self, "_wpp_started_at", None)
-        if started_at is not None and (now - started_at) < self._LOGOUT_STARTUP_GRACE_SECONDS:
+        if started_at is None:
+            started_at = getattr(self, "_app_start_time", now)
+            self._wpp_started_at = started_at
+        if (now - started_at) < self._LOGOUT_STARTUP_GRACE_SECONDS:
             logging.warning(
                 "[check_wa_connection_http] Saw unlinked state '%s' only %.0fs after "
                 "WPPConnect started — still within the %ds startup grace, ignoring.",

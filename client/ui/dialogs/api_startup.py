@@ -24,9 +24,9 @@ import wx
 class ApiStartupDialog(wx.Dialog):
     """Indeterminate-progress dialog shown while WPPConnect Server starts."""
 
-    _PULSE_MS        = 80     # gauge pulse interval
-    _POLL_INTERVAL_S = 0.5    # how often to probe the port
-    _TIMEOUT_S       = 300    # 5 minutes
+    _PULSE_MS        = 50     # gauge pulse interval
+    _POLL_INTERVAL_S = 0.1    # fast probe for instant WebSocket gateway startup
+    _TIMEOUT_S       = 30     # 30 seconds max timeout
 
     def __init__(self, parent, port):
         from core.i18n import I18n

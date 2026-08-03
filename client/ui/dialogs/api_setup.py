@@ -112,57 +112,19 @@ _PRESERVE = {"start.js", ".env", "config.json"}
 # version would silently keep its config.json forever — including any
 # createOptions a newer release changed. `.env` is deliberately absent: it is
 # the one root file that could be genuinely local, and nothing reads it anyway.
-_CUSTOM_ROOT_FILES = ["start.js", "config.json"]
+_CUSTOM_ROOT_FILES = ["start.js", "config.json", "tsconfig.json"]
 
-# Only these keys are copied from api_patches/package.json onto whatever the
-# downloaded ZIP produced — same list, and same reasoning, as setup_api.py's
-# _PATCHED_DEPENDENCY_KEYS. Merging the whole "dependencies" block would also
-# roll every OTHER dependency back to whatever was frozen in api_patches/ at
-# some earlier point, and overwriting the file wholesale would freeze
-# WPPConnect's own "version" field — which is what WppUpdateChecker compares
-# against the latest GitHub release — at a value that has nothing to do with
-# the tag actually downloaded here.
-#
-# @wppconnect-team/wppconnect is deliberately NOT in this list. It used to be,
-# pinned to an exact version that went stale within days — this dependency
-# releases multiple times a week, and wppconnect-server's own package.json can
-# (and did) move on to requiring a newer one than whatever WinZapp had frozen,
-# silently running an incompatible pairing with no error anywhere. Leaving it
-# out means upstream's own declared range wins, same as every other unpinned
-# dependency — and @wppconnect/wa-js / @wppconnect/wa-version, which WinZapp
-# never pins directly either, come along transitively at whichever paired
-# version @wppconnect-team/wppconnect itself resolves to.
 _PATCHED_DEPENDENCY_KEYS = [
-    "@ffmpeg-installer/ffmpeg",  # vendors a real ffmpeg binary — WinZapp's own
-                                  # Python side shells out to it directly to
-                                  # encode voice messages to OGG/Opus.
+    "@whiskeysockets/baileys",
 ]
 
-# Runtime state dirs/files that should survive a re-download.
-_KEEP_RUNTIME = {"wppconnect_tokens", "userDataDir", "wppconnect.log"}
+_KEEP_RUNTIME = {"tokens", "userDataDir", "wppconnect.log"}
 
-# WinZapp's patches on top of upstream wppconnect-server — same list as
-# setup_api.py's custom_files and build.py's API_CUSTOM_SRC_FILES. Unlike
-# _PRESERVE (root-level files skipped outright during extraction), these live
-# under src/ and get deleted by the "clean previous partial setup" step and
-# then are not part of _PRESERVE's skip-list during extraction, so a vanilla
-# ZIP re-download used to silently replace them with unpatched upstream code
-# — every call to this dialog (first-run setup AND the update/force-reinstall
-# flow) stripped WinZapp's own controller/util/middleware fixes with no
-# restoration step. _run_setup() now stashes their content before the clean
-# step and restores it after extraction, mirroring setup_api.py's approach.
 _CUSTOM_SRC_FILES = [
-    "src/config.ts",
-    "src/index.ts",
-    "src/util/createSessionUtil.ts",
-    "src/util/sessionUtil.ts",
-    "src/util/functions.ts",
-    "src/middleware/statusConnection.ts",
-    "src/controller/deviceController.ts",
-    "src/controller/messageController.ts",
-    "src/controller/sessionController.ts",
-    "src/routes/index.ts",
-    "decrypt.js",
+    "src/types.ts",
+    "src/baileysManager.ts",
+    "src/routes.ts",
+    "src/server.ts",
 ]
 
 
@@ -532,30 +494,20 @@ class ApiSetupDialog(wx.Dialog):
 
     def _run_setup(self):
         import sys
-        import shutil
-
-        if sys.platform == "win32":
-            node_exe = resource_path("node", "node.exe")
-            npm_cli  = resource_path("node", "node_modules", "npm", "bin", "npm-cli.js")
-            npm_cmd  = [node_exe, npm_cli]
-            node_dir = resource_path("node")
-            path_env = node_dir + os.pathsep + os.environ.get("PATH", "")
-        else:
-            local_node = resource_path("node", "node")
-            if os.path.isfile(local_node):
-                node_exe = local_node
-            else:
-                node_exe = shutil.which("node") or "node"
-            local_npm = resource_path("node", "node_modules", "npm", "bin", "npm-cli.js")
-            if os.path.isfile(local_npm):
-                npm_cmd = [node_exe, local_npm]
-            else:
-                npm_cmd = [shutil.which("npm") or "npm"]
-            node_dir = os.path.dirname(node_exe) if os.path.isabs(node_exe) else ""
-            path_env = (node_dir + os.pathsep + os.environ.get("PATH", "")) if node_dir else os.environ.get("PATH", "")
-
-        api_dir  = resource_path("api")
-        puppeteer_cache = resource_path("api", ".cache", "puppeteer")
+        self._set_stage(self._i18n.t("api_setup_building"), 10, 90)
+        try:
+            root_dir = os.path.dirname(resource_path())
+            setup_script = os.path.join(root_dir, "setup_api.py")
+            if not os.path.isfile(setup_script):
+                setup_script = resource_path("setup_api.py")
+            
+            proc = subprocess.run([sys.executable, setup_script], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            if proc.returncode != 0:
+                wx.CallAfter(self._finish_error, f"Setup failed: {proc.stderr[:300]}")
+                return
+            wx.CallAfter(self._finish_success)
+        except Exception as exc:
+            wx.CallAfter(self._finish_error, str(exc))
         npm_env  = {
             **os.environ,
             "PATH": path_env,

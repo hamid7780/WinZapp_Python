@@ -878,48 +878,19 @@ class WppUpdateChecker:
         self._retry_timer = None
 
     def start(self):
-        """Launch the first check in a background thread."""
-        t = threading.Thread(target=self._check_once, daemon=True)
-        t.start()
+        """No-op: Baileys Gateway Server does not use external WPPConnect updates."""
+        return
 
     def force_check(self):
-        """Called from a forced re-check (mirrors UpdateChecker.force_check)."""
-        if self._retry_timer is not None:
-            self._retry_timer.cancel()
-            self._retry_timer = None
-        t = threading.Thread(target=self._check_once, daemon=True)
-        t.start()
+        """No-op."""
+        return
 
     def force_reinstall(self):
-        """
-        Called from Help > Force Reinstall WPPConnect. Skips the version
-        comparison entirely — always fetches whatever is currently the
-        latest release and replaces the installed one with it, to recover a
-        broken/corrupted API install without waiting for a real version
-        bump to be detected.
-        """
-        if self._retry_timer is not None:
-            self._retry_timer.cancel()
-            self._retry_timer = None
-        t = threading.Thread(target=self._force_reinstall_worker, daemon=True)
-        t.start()
-
-    # ── Internal ──────────────────────────────────────────────────────────────
-
-    @staticmethod
-    def _fetch_latest_tag() -> str:
-        from ui.dialogs.api_setup import fetch_latest_wpp_tag
-        return fetch_latest_wpp_tag()
+        """No-op."""
+        return
 
     def _check_once(self):
-        logging.info("[WppUpdateChecker] Checking for wppconnect-server updates...")
-        installed = self._mw._get_installed_wpp_version()
-        if not installed:
-            # Not installed yet (or version unreadable) — the normal
-            # first-run setup / version-gate flow owns that case, not this
-            # checker.
-            self._schedule_retry()
-            return
+        return
 
         tag = self._fetch_latest_tag()
         if not tag:

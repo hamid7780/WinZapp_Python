@@ -34,8 +34,8 @@ class Connect:
         self.i18n.get_language()
         self.connection_mode = "phone"  # Default mode: qrcode or phone
 
-        # Phone-field state (formatter + country selector)
-        self._current_dial_code: str = "55"   # Brazil default
+        # Phone-field state (auto-detect country dial code from system locale/location)
+        self._current_dial_code: str = self._detect_default_dial_code()
         self._phone_updating:    bool = False  # reentrancy guard for EVT_TEXT
 
         # Incremented on every new pairing attempt and every cancel/close, so
@@ -45,7 +45,30 @@ class Connect:
         # dialogs — see on_continue()'s docstring for why this exists.
         self._pairing_attempt_id: int = 0
 
-    # ── Helpers ────────────────────────────────────────────────────────────
+    def _detect_default_dial_code(self) -> str:
+        """Detect default country dial code from Windows system GeoLocation or locale."""
+        try:
+            import sys
+            if sys.platform == "win32":
+                import ctypes
+                buf = ctypes.create_unicode_buffer(10)
+                if ctypes.windll.kernel32.GetUserDefaultGeoName(buf, 10) > 0:
+                    geo = buf.value.upper()
+                    _geo_map = {
+                        "PK": "92", "BR": "55", "US": "1", "IN": "91", "PT": "351",
+                        "ES": "34", "GB": "44", "AE": "971", "SA": "966", "CA": "1"
+                    }
+                    if geo in _geo_map:
+                        return _geo_map[geo]
+            import locale
+            loc = (locale.getlocale()[0] or locale.getdefaultlocale()[0] or "").upper()
+            if "PK" in loc or "UR" in loc: return "92"
+            if "BR" in loc or "PT" in loc: return "55"
+            if "US" in loc: return "1"
+            if "IN" in loc or "HI" in loc: return "91"
+        except Exception:
+            pass
+        return "92"
 
     def _wpp_headers(self, use_global_key=False):
         """Return headers for WPPConnect Server API requests."""
@@ -380,7 +403,13 @@ class Connect:
             style=wx.CB_READONLY,
             choices=[c[0] for c in self._countries],
         )
-        self.country_combo.SetSelection(0)   # Brazil
+        # Select auto-detected country index if matching dial code is found
+        def_idx = 0
+        for i, (_, code) in enumerate(self._countries):
+            if code == self._current_dial_code:
+                def_idx = i
+                break
+        self.country_combo.SetSelection(def_idx)
         self.country_combo.Bind(wx.EVT_COMBOBOX, self.on_country_changed)
 
         # ── Phone number field ────────────────────────────────────────────
@@ -602,9 +631,10 @@ class Connect:
                 return
 
             # Poll status-session to pick up a QR code that may already be ready.
+            session_id = self.main_window.token.split(':')[0] if self.main_window.token else "default"
             url = (
                 f"{self.main_window.wpp_server}"
-                f":{self.main_window.wpp_port}/api/{self.main_window.token}/status-session"
+                f":{self.main_window.wpp_port}/api/{session_id}/status-session"
             )
             try:
                 response = requests.get(url, headers=self._wpp_headers())
@@ -784,19 +814,24 @@ class Connect:
         code) at once. my_attempt/self._pairing_attempt_id lets the thread
         recognize it's been superseded and bail out silently instead.
         """
-        self.phone_number = "".join(
-            c for c in self.phone_field.GetValue() if c.isdigit()
-        )
-        if not self.phone_number:
+        raw_phone = "".join(c for c in self.phone_field.GetValue() if c.isdigit())
+        if not raw_phone:
             return
+
+        # Ensure international dial code prefix is present and strip any leading zero after dial code
+        dial_code = getattr(self, '_current_dial_code', '')
+        if dial_code:
+            if raw_phone.startswith(dial_code):
+                local_part = raw_phone[len(dial_code):].lstrip('0')
+                self.phone_number = dial_code + local_part
+            else:
+                local_part = raw_phone.lstrip('0')
+                self.phone_number = dial_code + local_part
+        else:
+            self.phone_number = raw_phone
 
         self._pairing_attempt_id += 1
         my_attempt = self._pairing_attempt_id
-        # Narrow "a pairing is actively in flight" window used by
-        # WebSocketClient.on_connection_update to tell a failed pairing
-        # (connection opens then closes again before real data ever arrives)
-        # apart from an ordinary reconnect hiccup on an already-paired
-        # account — see main.py's _pairing_in_progress for the full story.
         self.main_window._pairing_in_progress = True
 
         # Disable continue button and show connecting status to user
@@ -814,25 +849,18 @@ class Connect:
             try:
                 # Capture the old token to close it, preventing conflict
                 _old_token = self.main_window.token or ""
-                # Reuse the stored session only when it belongs to this same
-                # number AND the pairing actually completed — see
-                # _can_reuse_existing_session() for why the token alone is not
-                # enough. It normalises the stored number to digits itself.
                 _privateinfo = self.main_window.settings.get("privateinfo", {})
                 existing_token = self.main_window._get_wa_token()
                 _instance_exists = self._can_reuse_existing_session(
                     _privateinfo, self.phone_number, existing_token
                 )
                 if not _instance_exists:
-                    # New pairing: reset sync flag so we wait for messages.set
                     self.main_window.messages_set_completed = False
                     self.main_window.clear_local_data()
 
                 if _instance_exists:
                     self.main_window.token = existing_token
                 else:
-                    # Kill any leftover Chromium sessions from previous failed attempts
-                    # so only ONE browser runs at a time (prevents Auto Close race).
                     self._cleanup_orphan_sessions(keep_token="")
                     raw_token = self.generate_random_token()
                     url = f"{self.main_window.wpp_server}:{self.main_window.wpp_port}/api/{raw_token}/{self.main_window.wpp_api_key}/generate-token"
@@ -846,13 +874,7 @@ class Connect:
                     except Exception:
                         self.main_window.token = raw_token
 
-                # Terminate any existing session running on the server. If a session is already
-                # active/initializing in QR code mode (e.g. from the startup check), WPPConnect
-                # will ignore new start-session requests, and the pairing code will never generate.
-                # We fire close-session and immediately set up the WebSocket in parallel to avoid
-                # the 2s blocking wait — the Node side handles the close asynchronously.
                 _current_token = self.main_window.token or ""
-                # Close the actual old session instead of the new session
                 _session_name = _old_token.split(':')[0] if _old_token else ""
                 _close_headers = self._wpp_headers(use_global_key=True)
                 close_done = threading.Event()
@@ -874,16 +896,9 @@ class Connect:
                         close_done.set()
 
                 threading.Thread(target=_close_and_signal, daemon=True).start()
-
-                # Wait for close to finish (max 3s) so Node has time to release the session
-                # and unlock userDataDir before we call /start-session.
                 close_done.wait(timeout=3)
 
                 if my_attempt != self._pairing_attempt_id:
-                    # Superseded — the user cancelled and/or started a newer
-                    # attempt while this one was waiting. Stop here instead
-                    # of creating a WebSocketClient/session for an attempt
-                    # nobody is looking at anymore.
                     logging.info("[_bg_pairing_flow] Attempt %d superseded before start-session — aborting.", my_attempt)
                     return
 
@@ -899,10 +914,10 @@ class Connect:
                     self.main_window.ws._phone_code_event.clear()
                     self.main_window.ws._phone_code_value = ""
 
-                # Call /start-session in a background thread. This immediately registers the namespace on Node side.
+                session_id = self.main_window.token.split(':')[0] if self.main_window.token else "default"
                 url = (
                     f"{self.main_window.wpp_server}"
-                    f":{self.main_window.wpp_port}/api/{self.main_window.token}/start-session"
+                    f":{self.main_window.wpp_port}/api/{session_id}/start-session"
                 )
                 payload = {"phone": self.phone_number, "waitQrCode": False}
                 ws_ref = self.main_window.ws  # capture before thread starts
@@ -912,17 +927,15 @@ class Connect:
                     try:
                         resp = requests.post(url, json=payload, headers=headers, timeout=120)
                         logging.info("[_call_start_session] start-session response status: %s, body: %s", resp.status_code, resp.text[:300])
-                        if resp.status_code not in (200, 201):
+                        if resp.status_code in (200, 201):
+                            inline_code = resp.json().get("phoneCode", "")
+                            if inline_code and hasattr(ws_ref, '_phone_code_event') and not ws_ref._phone_code_event.is_set():
+                                ws_ref._phone_code_value = str(inline_code)
+                                ws_ref._phone_code_event.set()
+                        else:
                             logging.error("[_call_start_session] start-session failed with HTTP %s: %s", resp.status_code, resp.text[:200])
-                            ws_ref._phone_code_event.set()
-                            return
-                        inline_code = resp.json().get("phoneCode", "")
-                        if inline_code and not ws_ref._phone_code_event.is_set():
-                            ws_ref._phone_code_value = str(inline_code)
-                            ws_ref._phone_code_event.set()
                     except Exception as exc:
                         logging.error("[_call_start_session] Exception during start-session: %s", exc)
-                        ws_ref._phone_code_event.set()
 
                 threading.Thread(target=_call_start_session, daemon=True).start()
 

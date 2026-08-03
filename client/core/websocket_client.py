@@ -1097,10 +1097,16 @@ class WebSocketClient:
             if session and session != self.instance_name:
                 return
                 
-            if status in ("disconnectedMobile", "notLogged"):
-                # Handle permanent WhatsApp logout / disconnection.
-                # Only trigger if we were previously fully connected (preventing startup false positives).
-                if self.main_window._wa_connected and self.main_window.settings.get("privateinfo", {}).get("paired"):
+            if status in ("disconnectedMobile", "notLogged", "QRCODE"):
+                if getattr(self.main_window, "_pairing_in_progress", False):
+                    logging.info("[on_wpp_status_find] Pairing in progress — ignoring status-find trigger.")
+                    return
+                if not self.main_window.settings.get("privateinfo", {}).get("paired"):
+                    if hasattr(self.connect, "_is_pairing_dialog_active") and not self.connect._is_pairing_dialog_active():
+                        wx.CallAfter(self.connect.show_connection_dial)
+                    elif not hasattr(self.connect, "_is_pairing_dialog_active"):
+                        wx.CallAfter(self.connect.show_connection_dial)
+                elif self.main_window._wa_connected:
                     wx.CallAfter(self._handle_logout)
         except Exception:
             logging.exception("[WebSocketClient] on_wpp_status_find error")
