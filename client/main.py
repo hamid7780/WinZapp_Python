@@ -3315,22 +3315,13 @@ class MainWindow(wx.Frame):
         if os.path.isfile(dist_server) and os.path.isdir(node_modules):
             return
 
-        if self.background_mode:
-            sys.exit(0)
-
-        # One dialog for both cases — it detects internally whether
-        # dist/server.js already exists and runs only the npm-install portion
-        # of its flow when so, instead of a second dialog for that case.
-        from ui.dialogs.api_setup import ApiSetupDialog
-        def _show_api_setup():
-            dlg = ApiSetupDialog(self)
-            res = dlg.ShowModal()
-            dlg.Destroy()
-            return res
-        result = self.run_on_main_thread(_show_api_setup)
-
-        if result != wx.ID_OK:
-            sys.exit(0)
+        # Run setup_api.py silently if needed
+        try:
+            setup_script = os.path.join(ROOT_DIR, "setup_api.py")
+            if os.path.isfile(setup_script):
+                subprocess.run([sys.executable, setup_script], check=True, timeout=60)
+        except Exception as e:
+            logging.warning("[ensure_api_modules_installed] Silent setup_api.py failed: %s", e)
 
     # ── WPPConnect version gate ───────────────────────────────────────────────
 

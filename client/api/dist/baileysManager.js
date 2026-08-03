@@ -140,6 +140,7 @@ class BaileysManager {
                 this.io.emit('connection.update', connPayload);
                 this.io.emit('session-logged', { status: true, session, data: connPayload.data });
                 this.io.emit('status-find', { status: 'CONNECTED', session });
+                this.io.emit('messages.set', { session });
                 return 'CONNECTED';
             }
         }
@@ -240,6 +241,7 @@ class BaileysManager {
                 this.io.emit('connection.update', connPayload);
                 this.io.emit('session-logged', { status: true, session, data: connPayload.data });
                 this.io.emit('status-find', { status: 'CONNECTED', session });
+                this.io.emit('messages.set', { session });
             }
             if (connection === 'close') {
                 const statusCode = lastDisconnect?.error?.output?.statusCode;
