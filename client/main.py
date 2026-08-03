@@ -3249,79 +3249,24 @@ class MainWindow(wx.Frame):
         # background if any are missing — no dialog needed.
         ffmpeg_bin = self._find_api_ffmpeg()
         _REQUIRED_MARKERS = [
-            os.path.join(node_modules, "@babel", "runtime"),
+            os.path.join(node_modules, "express"),
+            os.path.join(node_modules, "@whiskeysockets", "baileys"),
+            os.path.join(node_modules, "socket.io"),
         ]
-        if os.path.isfile(dist_server) and os.path.isdir(node_modules):
-            missing = [m for m in _REQUIRED_MARKERS if not os.path.isdir(m)]
-            if not ffmpeg_bin:
-                missing.append(os.path.join(node_modules, "@ffmpeg-installer", "ffmpeg"))
-            if missing:
-                logging.info(
-                    "[ensure_api_modules_installed] Missing packages detected: %s — running npm install",
-                    missing,
-                )
-                if sys.platform == "win32":
-                    node_exe = resource_path("node", "node.exe")
-                    npm_cli  = resource_path("node", "node_modules", "npm", "bin", "npm-cli.js")
-                    npm_cmd  = [node_exe, npm_cli]
-                    node_dir = resource_path("node")
-                    path_env = node_dir + os.pathsep + os.environ.get("PATH", "")
-                else:
-                    local_node = resource_path("node", "node")
-                    if os.path.isfile(local_node):
-                        node_exe = local_node
-                    else:
-                        node_exe = shutil.which("node") or "node"
-                    local_npm = resource_path("node", "node_modules", "npm", "bin", "npm-cli.js")
-                    if os.path.isfile(local_npm):
-                        npm_cmd = [node_exe, local_npm]
-                    else:
-                        npm_cmd = [shutil.which("npm") or "npm"]
-                    node_dir = os.path.dirname(node_exe) if os.path.isabs(node_exe) else ""
-                    path_env = (node_dir + os.pathsep + os.environ.get("PATH", "")) if node_dir else os.environ.get("PATH", "")
 
-                npm_env  = {
-                    **os.environ,
-                    "PATH": path_env,
-                    "PUPPETEER_CACHE_DIR": resource_path("api", ".cache", "puppeteer"),
-                }
-                api_dir  = resource_path("api")
-                creation_flags = 0
-                if sys.platform == "win32" and hasattr(subprocess, "CREATE_NO_WINDOW"):
-                    creation_flags = subprocess.CREATE_NO_WINDOW
-
-                try:
-                    proc = subprocess.Popen(
-                        npm_cmd + ["install", "--no-audit", "--no-fund", "--include=optional", "--legacy-peer-deps"],
-                        cwd=api_dir,
-                        env=npm_env,
-                        creationflags=creation_flags,
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.PIPE,
-                    )
-                    _, stderr_bytes = proc.communicate()
-                    if proc.returncode != 0:
-                        logging.error(
-                            "[ensure_api_modules_installed] npm install failed: %s",
-                            (stderr_bytes or b"").decode("utf-8", errors="replace"),
-                        )
-                    else:
-                        logging.info("[ensure_api_modules_installed] npm install completed OK")
-                except Exception as exc:
-                    logging.error("[ensure_api_modules_installed] npm install error: %s", exc)
-            return
-
-        # Everything already set up — nothing to do.
-        if os.path.isfile(dist_server) and os.path.isdir(node_modules):
-            return
-
-        # Run setup_api.py silently if needed
-        try:
-            setup_script = os.path.join(ROOT_DIR, "setup_api.py")
-            if os.path.isfile(setup_script):
-                subprocess.run([sys.executable, setup_script], check=True, timeout=60)
-        except Exception as e:
-            logging.warning("[ensure_api_modules_installed] Silent setup_api.py failed: %s", e)
+        missing = [m for m in _REQUIRED_MARKERS if not os.path.exists(m)]
+        if not os.path.isfile(dist_server) or missing:
+            logging.info("[ensure_api_modules_installed] Gateway server or dependencies missing (%s) — running setup_api.py...", missing)
+            try:
+                setup_script = os.path.join(os.path.dirname(resource_path("api")), "setup_api.py")
+                if not os.path.isfile(setup_script):
+                    setup_script = os.path.join(ROOT_DIR, "setup_api.py")
+                if os.path.isfile(setup_script):
+                    res = subprocess.run([sys.executable, setup_script], cwd=os.path.dirname(setup_script), timeout=180)
+                    if res.returncode == 0:
+                        logging.info("[ensure_api_modules_installed] setup_api.py completed successfully")
+            except Exception as e:
+                logging.error("[ensure_api_modules_installed] setup_api.py execution failed: %s", e)
 
     # ── WPPConnect version gate ───────────────────────────────────────────────
 
