@@ -602,6 +602,7 @@ export class BaileysManager {
         const isGroup = jid.endsWith('@g.us');
         const name = c.name || (c as any).subject || contact.name || contact.notify || jid.split('@')[0];
 
+        const chatTs = Number(c.conversationTimestamp || (c as any).t || Math.floor(Date.now() / 1000));
         chats.push({
           id: { _serialized: jid },
           remoteJid: jid,
@@ -609,7 +610,8 @@ export class BaileysManager {
           pushName: contact.notify || contact.name || '',
           unreadCount: c.unreadCount || 0,
           isGroup: isGroup,
-          timestamp: c.conversationTimestamp || Math.floor(Date.now() / 1000)
+          t: chatTs,
+          timestamp: chatTs
         });
       }
     }
@@ -624,6 +626,7 @@ export class BaileysManager {
         const contact = (store.contacts && store.contacts[jidKey]) || (store.contacts && store.contacts[jid]) || {};
         const isGroup = jid.endsWith('@g.us');
         const name = contact.name || contact.notify || jid.split('@')[0];
+        const chatTs = Math.floor(Date.now() / 1000);
 
         chats.push({
           id: { _serialized: jid },
@@ -632,7 +635,8 @@ export class BaileysManager {
           pushName: contact.notify || contact.name || '',
           unreadCount: 0,
           isGroup: isGroup,
-          timestamp: Math.floor(Date.now() / 1000)
+          t: chatTs,
+          timestamp: chatTs
         });
       }
     }
@@ -782,17 +786,41 @@ export class BaileysManager {
     const msgId = key.id || '';
     const serializedId = `${key.fromMe}_${remoteJid}_${msgId}`;
 
-    const text = msg.message?.conversation || msg.message?.extendedTextMessage?.text || '';
+    const messageObj = msg.message || {};
+    const text = messageObj.conversation || messageObj.extendedTextMessage?.text || messageObj.imageMessage?.caption || messageObj.videoMessage?.caption || messageObj.documentMessage?.caption || '';
+
+    const isAudio = Boolean(messageObj.audioMessage);
+    const isPtt = isAudio && Boolean(messageObj.audioMessage?.ptt !== false);
+    const isImage = Boolean(messageObj.imageMessage);
+    const isVideo = Boolean(messageObj.videoMessage);
+    const isDocument = Boolean(messageObj.documentMessage);
+    const isSticker = Boolean(messageObj.stickerMessage);
+
+    let type = 'chat';
+    if (isPtt) type = 'ptt';
+    else if (isAudio) type = 'audio';
+    else if (isImage) type = 'image';
+    else if (isVideo) type = 'video';
+    else if (isDocument) type = 'document';
+    else if (isSticker) type = 'sticker';
+
+    const duration = messageObj.audioMessage?.seconds || messageObj.videoMessage?.seconds || 0;
+    const ts = typeof msg.messageTimestamp === 'number' ? msg.messageTimestamp : Math.floor(Date.now() / 1000);
 
     return {
       id: { _serialized: serializedId, id: msgId, fromMe: key.fromMe || false, remote: remoteJid },
       from: key.fromMe ? (this.sessions.get('default')?.user?.id || '') : (key.participant || remoteJid),
       to: key.fromMe ? remoteJid : (this.sessions.get('default')?.user?.id || ''),
       fromMe: key.fromMe || false,
-      type: msg.message?.audioMessage ? 'ptt' : (msg.message?.imageMessage ? 'image' : 'chat'),
+      type,
       body: text,
-      text: text,
-      timestamp: typeof msg.messageTimestamp === 'number' ? msg.messageTimestamp : Math.floor(Date.now() / 1000)
+      caption: text,
+      text,
+      duration,
+      seconds: duration,
+      mimetype: messageObj.audioMessage?.mimetype || messageObj.imageMessage?.mimetype || messageObj.documentMessage?.mimetype || '',
+      t: ts,
+      timestamp: ts
     };
   }
 }
