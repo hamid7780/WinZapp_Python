@@ -26,7 +26,7 @@ WinZapp has been migrated from legacy **WPPConnect** (heavy Puppeteer / Headless
 1. **Connection Dialog (`client/ui/dialogs/connect.py`)**:
    - Added automatic country dial code detection (`_detect_default_dial_code()`) via Windows GeoLocation (`GetUserDefaultGeoName`) & system locale (auto-selects `Pakistan (+92)` on PK systems instead of hardcoded `Brazil (+55)`).
    - Added automatic leading zero stripping (e.g. `03001234567` + `92` -> `923001234567`), eliminating invalid 13-digit number mismatches.
-   - Updated phone pairing flow (`_bg_pairing_flow`) to clean session IDs before calling API URLs.
+   - Fixed `_bg_pairing_flow` race condition where `close-session` was closing the active new session socket during pairing setup.
    - Fixed `_call_start_session()` so `_phone_code_event.set()` is only called when an actual non-empty pairing code is received.
 2. **WebSocket Client (`client/core/websocket_client.py`)**:
    - Added guard in `on_wpp_status_find` so status events (`notLogged`/`QRCODE`) are ignored while `_pairing_in_progress` is True. This prevents `show_connection_dial` from closing the open `pairing_dial` dialog.

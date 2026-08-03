@@ -94,6 +94,23 @@ export class BaileysManager {
 
     this.sessionStatus.set(session, 'INITIALIZING');
     const sessionDir = path.join(this.tokensDir, session);
+
+    // If phone pairing is requested, wipe any stale unregistered auth folder so pairing uses fresh keys
+    if (phone && fs.existsSync(sessionDir)) {
+      const credsFile = path.join(sessionDir, 'creds.json');
+      if (fs.existsSync(credsFile)) {
+        try {
+          const creds = JSON.parse(fs.readFileSync(credsFile, 'utf-8'));
+          if (!creds.me || !creds.me.id || !creds.registered) {
+            console.log(`[BaileysManager] Session ${session} is unregistered. Wiping stale auth state.`);
+            fs.rmSync(sessionDir, { recursive: true, force: true });
+          }
+        } catch (e) {
+          fs.rmSync(sessionDir, { recursive: true, force: true });
+        }
+      }
+    }
+
     if (!fs.existsSync(sessionDir)) {
       fs.mkdirSync(sessionDir, { recursive: true });
     }

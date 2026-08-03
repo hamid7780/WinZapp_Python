@@ -879,8 +879,9 @@ class Connect:
                 _close_headers = self._wpp_headers(use_global_key=True)
                 close_done = threading.Event()
 
+                _new_session_name = self.main_window.token.split(':')[0] if self.main_window.token else "default"
                 def _close_and_signal():
-                    if not _session_name:
+                    if not _session_name or _session_name == _new_session_name:
                         close_done.set()
                         return
                     try:
