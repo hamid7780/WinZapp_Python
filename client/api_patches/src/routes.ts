@@ -171,8 +171,9 @@ export function createRouter(manager: BaileysManager): Router {
   router.post('/api/:session/send-voice-base64', authCheck, async (req: Request, res: Response) => {
     try {
       const { session } = req.params;
-      const { phone, base64 } = req.body || {};
-      const resp = await manager.sendVoiceBase64(session, phone, base64);
+      const { phone, base64, base64Ptt, base64Data } = req.body || {};
+      const rawB64 = base64Ptt || base64 || base64Data || '';
+      const resp = await manager.sendVoiceBase64(session, phone, rawB64);
       return res.status(200).json({ status: 'SUCCESS', response: resp });
     } catch (err: any) {
       return res.status(500).json({ status: 'ERROR', message: err.message });
@@ -183,8 +184,9 @@ export function createRouter(manager: BaileysManager): Router {
   router.post(['/api/:session/send-file-base64', '/api/:session/send-image', '/api/:session/send-file'], authCheck, async (req: Request, res: Response) => {
     try {
       const { session } = req.params;
-      const { phone, base64, caption, isImage } = req.body || {};
-      const resp = await manager.sendMediaBase64(session, phone, base64, caption, isImage !== false);
+      const { phone, base64, base64Data, caption, isImage } = req.body || {};
+      const rawB64 = base64 || base64Data || '';
+      const resp = await manager.sendMediaBase64(session, phone, rawB64, caption, isImage !== false);
       return res.status(200).json({ status: 'SUCCESS', response: resp });
     } catch (err: any) {
       return res.status(500).json({ status: 'ERROR', message: err.message });

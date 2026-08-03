@@ -244,6 +244,29 @@ export class BaileysManager {
       }
     });
 
+    // Handle Messaging History Sync
+    sock.ev.on('messaging-history.set', ({ chats, contacts, messages }) => {
+      console.log(`[BaileysManager] messaging-history.set synced for ${session}: ${chats?.length || 0} chats, ${contacts?.length || 0} contacts, ${messages?.length || 0} messages`);
+      if (Array.isArray(messages)) {
+        for (const msg of messages) {
+          if (!msg.message) continue;
+          const msgId = msg.key.id || '';
+          if (msgId) {
+            this.messageCache.set(msgId, msg);
+          }
+          const canonicalMsg = this.formatCanonicalMessage(msg);
+          canonicalMsg.isMdHistoryMsg = true;
+
+          this.io.emit('messages.upsert', {
+            event: 'messages.upsert',
+            instance: session,
+            data: canonicalMsg
+          });
+        }
+      }
+      this.io.emit('messages.set', { session });
+    });
+
     // Handle Messages Upsert
     sock.ev.on('messages.upsert', async (m) => {
       const { messages, type } = m;
@@ -415,6 +438,7 @@ export class BaileysManager {
     if (!sock) throw new Error('Session not connected');
 
     const jid = this.normalizeJid(phone);
+    if (!base64Data) throw new Error('No base64 voice audio data provided');
     const cleanBase64 = base64Data.includes('base64,') ? base64Data.split('base64,')[1] : base64Data;
     const buffer = Buffer.from(cleanBase64, 'base64');
 
