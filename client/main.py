@@ -3129,86 +3129,55 @@ class MainWindow(wx.Frame):
     # ── First-run module installation ──────────────────────────────────────
 
     def ensure_api_modules_installed(self):
-        """
-        Ensure the WPPConnect is cloned, compiled, and has its node_modules.
-
-        node/node.exe is mandatory in all scenarios — it is the portable Node.js
-        runtime bundled with WinZapp that drives both npm and the API itself.
-        Its absence is always a fatal error.
-
-        Depending on what is present inside api/:
-
-          dist/server.js absent →  API not yet cloned/compiled (or the whole
-                                    api/ folder was deleted). Show
-                                    ApiSetupDialog, which clones + npm installs
-                                    + builds. Expected state for a fresh
-                                    install or first developer run.
-
-          dist/server.js present
-          node_modules absent   →  API already cloned/built, just node_modules
-                                    is missing — the normal state of every
-                                    fresh WinZapp.zip extract, since
-                                    node_modules isn't bundled. Still shows
-                                    ApiSetupDialog (the ONE setup dialog this
-                                    app has — used to be a second, separately
-                                    titled ModuleInstallDialog doing
-                                    practically the same thing, which was
-                                    confusing and had its own bugs), which
-                                    detects dist/server.js already exists and
-                                    runs only the npm-install portion of its
-                                    flow internally.
-
-          Both present          →  Nothing to do.
-
-        In background mode dialogs are never shown; if the setup is incomplete
-        the process exits silently.
-        """
+        """Ensure Baileys Gateway Server dependencies are installed in api/node_modules."""
         import sys
         import shutil
-        if sys.platform == "win32":
-            node_exe = resource_path("node", "node.exe")
-        else:
-            local_node = resource_path("node", "node")
-            if os.path.isfile(local_node):
-                node_exe = local_node
+        import subprocess
+
+        api_dir      = resource_path("api")
+        node_modules = resource_path("api", "node_modules")
+        dist_server  = resource_path("api", "dist", "server.js")
+        ROOT_DIR     = os.path.dirname(os.path.abspath(__file__))
+
+        _REQUIRED_MARKERS = [
+            os.path.join(node_modules, "express"),
+            os.path.join(node_modules, "@whiskeysockets", "baileys"),
+            os.path.join(node_modules, "socket.io"),
+        ]
+
+        def _is_missing():
+            return not os.path.isfile(dist_server) or any(not os.path.exists(m) for m in _REQUIRED_MARKERS)
+
+        if _is_missing():
+            logging.info("[ensure_api_modules_installed] Required modules missing in %s — running setup_api.py...", node_modules)
+            setup_script = os.path.join(ROOT_DIR, "setup_api.py")
+            if os.path.isfile(setup_script):
+                try:
+                    subprocess.run([sys.executable, setup_script], cwd=ROOT_DIR, check=True, timeout=300)
+                except Exception as ex:
+                    logging.error("[ensure_api_modules_installed] setup_api.py error: %s", ex)
+
+        # Fallback inline npm install if dependencies are STILL missing after setup_api.py
+        if _is_missing():
+            logging.warning("[ensure_api_modules_installed] Dependencies still missing — executing direct inline npm install...")
+            node_exe = resource_path("node", "node.exe") if sys.platform == "win32" else (shutil.which("node") or "node")
+            npm_cli  = resource_path("node", "node_modules", "npm", "bin", "npm-cli.js") if sys.platform == "win32" else (shutil.which("npm") or "npm")
+            
+            if os.path.isfile(node_exe) and os.path.isfile(npm_cli):
+                cmd = [node_exe, npm_cli, "install", "--no-audit", "--no-fund"]
             else:
-                node_exe = shutil.which("node") or "node"
+                cmd = ["npm", "install", "--no-audit", "--no-fund"]
 
-        dist_server  = resource_path("api",  "dist", "server.js")
-        node_modules = resource_path("api",  "node_modules")
+            try:
+                subprocess.run(cmd, cwd=api_dir, check=True, timeout=300)
+            except Exception as ex:
+                logging.error("[ensure_api_modules_installed] Direct inline npm install failed: %s", ex)
 
-        # start.js ships bundled with WinZapp itself — it is NOT fetched from
-        # WPPConnect's own repo by either install flow below. Its absence
-        # means this WinZapp installation itself is incomplete or corrupted
-        # (e.g. a partial/interrupted ZIP extraction), not just "WPPConnect
-        # hasn't been cloned yet" — attempting either install flow would not
-        # fix it (ApiSetupDialog only ever downloads WPPConnect's own source)
-        # and would just fail confusingly deep inside npm/WPPConnect startup
-        # instead. Fail fast with a clear, actionable message instead of
-        # trying anything.
-        #
-        # api/.env is deliberately NOT checked here: nothing reads it. The
-        # WPPConnect side has its dotenv load commented out (api/src/index.ts),
-        # start.js takes its settings from config.json plus the environment
-        # variables _start_wpp_background() injects (AUTHENTICATION_API_KEY,
-        # PORT, ...), and api/.gitignore excludes it so it never shipped in
-        # the ZIP either. Requiring it only ever aborted startup on a
-        # perfectly good install.
-        start_js = resource_path("api", "start.js")
-        if not os.path.isfile(start_js):
-            logging.error(
-                "[ensure_api_modules_installed] Missing required WinZapp file "
-                "api/start.js — installation appears incomplete.",
-            )
-            if not self.background_mode:
-                wx.MessageBox(
-                    self.i18n.t("api_files_missing_error"),
-                    self.i18n.t("error").format(app_name=self.app_name),
-                    wx.OK | wx.ICON_ERROR,
-                )
-            sys.exit(1)
+        if _is_missing():
+            raise RuntimeError(f"Failed to install required Baileys Gateway modules into {node_modules}")
 
         # Node.js is mandatory — auto-download portable version if missing.
+        node_exe = resource_path("node", "node.exe") if sys.platform == "win32" else (resource_path("node", "node") if os.path.isfile(resource_path("node", "node")) else (shutil.which("node") or "node"))
         if not os.path.isfile(node_exe):
             if self.background_mode:
                 logging.error("[ensure_api_modules_installed] Node.js not found and cannot show download dialog in background mode")
