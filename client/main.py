@@ -3441,18 +3441,23 @@ class MainWindow(wx.Frame):
 
             # Ensure client/api/dist/server.js is built with Baileys Gateway Server
             dist_server = resource_path("api", "dist", "server.js")
-            need_setup = True
-            if os.path.isfile(dist_server):
+            legacy_wpp = resource_path("api", "node_modules", "@wppconnect-team")
+            need_setup = os.path.exists(legacy_wpp)
+            if not need_setup and os.path.isfile(dist_server):
                 try:
                     with open(dist_server, "r", encoding="utf-8", errors="ignore") as f:
                         src_head = f.read(2000)
                     if "Baileys" in src_head or "baileys" in src_head or "BaileysManager" in src_head:
                         need_setup = False
+                    else:
+                        need_setup = True
                 except Exception:
                     need_setup = True
+            elif not os.path.isfile(dist_server):
+                need_setup = True
 
             if need_setup:
-                logging.info("[startup] Baileys Gateway Server not found in dist/server.js — compiling via setup_api.py...")
+                logging.info("[startup] Baileys Gateway Server missing or legacy WPPConnect present — running setup_api.py...")
                 try:
                     setup_py = os.path.join(os.path.dirname(resource_path("api")), "setup_api.py")
                     if os.path.isfile(setup_py):

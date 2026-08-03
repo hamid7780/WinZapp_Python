@@ -43,6 +43,31 @@ export class BaileysManager {
     if (!fs.existsSync(this.tokensDir)) {
       fs.mkdirSync(this.tokensDir, { recursive: true });
     }
+    this.autoRestoreSessions();
+  }
+
+  private autoRestoreSessions(): void {
+    try {
+      if (!fs.existsSync(this.tokensDir)) return;
+      const entries = fs.readdirSync(this.tokensDir, { withFileTypes: true });
+      for (const entry of entries) {
+        if (entry.isDirectory()) {
+          const sessionName = entry.name;
+          const credsFile = path.join(this.tokensDir, sessionName, 'creds.json');
+          if (fs.existsSync(credsFile)) {
+            try {
+              const creds = JSON.parse(fs.readFileSync(credsFile, 'utf-8'));
+              if (creds.me && creds.me.id && creds.registered) {
+                console.log(`[BaileysManager] Auto-restoring registered session: ${sessionName}`);
+                setTimeout(() => this.startSession(sessionName), 500);
+              }
+            } catch (e) {}
+          }
+        }
+      }
+    } catch (e) {
+      console.error('[BaileysManager] Failed to auto-restore sessions:', e);
+    }
   }
 
   private getSafeSessionName(session: string): string {

@@ -42,10 +42,18 @@ def main():
             pass
     os.makedirs(CLIENT_API_DIR, exist_ok=True)
 
-    # Clean old contents in CLIENT_API_DIR except node_modules and tokens
+    # Clean old contents in CLIENT_API_DIR except tokens and .git.
+    # If node_modules still contains legacy @wppconnect-team, remove node_modules so fresh Baileys packages are installed.
+    wpp_dir = os.path.join(CLIENT_API_DIR, "node_modules", "@wppconnect-team")
+    if os.path.exists(wpp_dir):
+        print("[INFO] Purging legacy WPPConnect node_modules...")
+        shutil.rmtree(os.path.join(CLIENT_API_DIR, "node_modules"), ignore_errors=True)
+
     if os.path.exists(CLIENT_API_DIR):
         for item in os.listdir(CLIENT_API_DIR):
-            if item in ("node_modules", "tokens", ".git"):
+            if item in ("tokens", ".git"):
+                continue
+            if item == "node_modules":
                 continue
             item_path = os.path.join(CLIENT_API_DIR, item)
             try:
