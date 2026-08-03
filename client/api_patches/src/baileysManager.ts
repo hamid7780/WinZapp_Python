@@ -10,6 +10,7 @@ import { Server as SocketIOServer } from 'socket.io';
 import QRCode from 'qrcode';
 import pino from 'pino';
 import makeWASocket, {
+  Browsers,
   useMultiFileAuthState,
   DisconnectReason,
   fetchLatestBaileysVersion,
@@ -108,7 +109,7 @@ export class BaileysManager {
       logger,
       printQRInTerminal: false,
       auth: state,
-      browser: ['WinZapp Desktop', 'Chrome', '1.0.0'],
+      browser: Browsers.ubuntu('Chrome'),
       generateHighQualityLinkPreview: true,
       syncFullHistory: false,
       markOnlineOnConnect: true,
