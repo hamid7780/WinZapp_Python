@@ -88,6 +88,15 @@ export class BaileysManager {
         this.sessions.delete(session);
         this.pairingCodes.delete(session);
       } else {
+        const userJid = existingSock.user?.id ? this.normalizeJid(existingSock.user.id) : '';
+        const connPayload = {
+          session,
+          state: 'open',
+          data: { state: 'open', wuid: userJid, phoneNumber: userJid }
+        };
+        this.io.emit('connection.update', connPayload);
+        this.io.emit('session-logged', { status: true, session, data: connPayload.data });
+        this.io.emit('status-find', { status: 'CONNECTED', session });
         return 'CONNECTED';
       }
     }
@@ -182,9 +191,22 @@ export class BaileysManager {
       }
 
       if (connection === 'open') {
-        console.log(`[BaileysManager] Session ${session} connected successfully!`);
+        const userJid = sock.user?.id ? this.normalizeJid(sock.user.id) : '';
+        console.log(`[BaileysManager] Session ${session} connected successfully as ${userJid}!`);
         this.sessionStatus.set(session, 'CONNECTED');
-        this.io.emit('session-logged', { status: true, session });
+
+        const connPayload = {
+          session,
+          state: 'open',
+          data: {
+            state: 'open',
+            wuid: userJid,
+            phoneNumber: userJid
+          }
+        };
+
+        this.io.emit('connection.update', connPayload);
+        this.io.emit('session-logged', { status: true, session, data: connPayload.data });
         this.io.emit('status-find', { status: 'CONNECTED', session });
       }
 
@@ -193,6 +215,17 @@ export class BaileysManager {
         const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
 
         console.log(`[BaileysManager] Session ${session} closed. Status code: ${statusCode}, shouldReconnect: ${shouldReconnect}`);
+
+        const closePayload = {
+          session,
+          state: 'close',
+          data: {
+            state: 'close',
+            statusCode,
+            loggedOut: statusCode === DisconnectReason.loggedOut
+          }
+        };
+        this.io.emit('connection.update', closePayload);
 
         if (statusCode === DisconnectReason.loggedOut) {
           this.sessionStatus.set(session, 'DISCONNECTED');
