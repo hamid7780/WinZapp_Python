@@ -187,7 +187,7 @@ export class BaileysManager {
       auth: state,
       browser: Browsers.ubuntu('Chrome'),
       generateHighQualityLinkPreview: true,
-      syncFullHistory: false,
+      syncFullHistory: true,
       markOnlineOnConnect: true,
     });
 
@@ -573,11 +573,50 @@ export class BaileysManager {
     });
   }
 
-  public async getMediaByMessage(session: string, msgId: string): Promise<string> {
+  public async getMediaByMessage(sessionRaw: string, msgId: string, reqBody?: any): Promise<string> {
+    const session = this.getSafeSessionName(sessionRaw);
     const cleanId = msgId.includes('_') ? msgId.split('_')[2] : msgId;
-    const msg = this.messageCache.get(cleanId);
+    let msg: WAMessage | undefined = this.messageCache.get(cleanId) || this.messageCache.get(msgId);
+
+    const store = this.stores.get(session);
+    if (!msg && store && store.messages) {
+      for (const jidKey in store.messages) {
+        const msgs = store.messages[jidKey];
+        if (Array.isArray(msgs)) {
+          msg = msgs.find((m: WAMessage) => m.key?.id === cleanId || m.key?.id === msgId);
+          if (msg) break;
+        }
+      }
+    }
+
+    if (!msg && reqBody && typeof reqBody === 'object') {
+      const remoteJid = reqBody.remoteJid || reqBody.from || reqBody.key?.remoteJid || '';
+      const fromMe = reqBody.fromMe ?? reqBody.key?.fromMe ?? false;
+      const mediaKey = reqBody.mediaKey ? Buffer.from(reqBody.mediaKey, 'base64') : undefined;
+      const clientUrl = reqBody.clientUrl || reqBody.url || '';
+      const directPath = reqBody.directPath || '';
+      const mimetype = reqBody.mimetype || 'audio/ogg; codecs=opus';
+      const msgType = reqBody.type === 'ptt' || reqBody.type === 'audio' ? 'audioMessage' : (reqBody.messageType || 'audioMessage');
+
+      msg = {
+        key: {
+          remoteJid,
+          fromMe,
+          id: cleanId
+        },
+        message: {
+          [msgType]: {
+            url: clientUrl,
+            directPath,
+            mediaKey,
+            mimetype
+          }
+        }
+      } as any;
+    }
+
     if (!msg) {
-      throw new Error(`Message ${msgId} not found in gateway cache`);
+      throw new Error(`Message ${msgId} not found in gateway cache or payload`);
     }
 
     const buffer = await downloadMediaMessage(

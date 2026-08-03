@@ -7370,6 +7370,7 @@ class MainWindow(wx.Frame):
         # first — reported live as archived groups appearing twice and opening
         # a different group than the one announced. Render each remoteJid once.
         _seen_render_jids: set[str] = set()
+        _seen_self_chat = False
 
         for jid, chat in list(self.chats.items()):
             if jid in deleted:
@@ -7475,7 +7476,14 @@ class MainWindow(wx.Frame):
                             if fallback_clean and "sem nome" not in fallback_clean.lower() and fallback_clean != self.i18n.t("unknown_contact"):
                                 name = fallback_clean
                             elif jid.endswith("@lid"):
-                                name = self.i18n.t("unknown_contact")
+                                msg_push = self.find_name_through_messages(chat)
+                                if msg_push:
+                                    name = msg_push
+                                elif phone_jid and not phone_jid.endswith("@lid"):
+                                    name = format_number(phone_jid)
+                                else:
+                                    numeric = jid.split("@")[0].split(":")[0]
+                                    name = format_number(numeric) if numeric.isdigit() else self.i18n.t("unknown_contact")
                             else:
                                 numeric = jid.split("@")[0].split(":")[0]
                                 if numeric.isdigit():
@@ -7492,6 +7500,9 @@ class MainWindow(wx.Frame):
                     f"chat_name={chat.get('name')} push_name={chat.get('pushName')} -> final_name='{name}'"
                 )
             if my_jid and not jid.endswith("@g.us") and self._is_self_jid(jid):
+                if _seen_self_chat:
+                    continue
+                _seen_self_chat = True
                 name = self.i18n.t("self_chat_name")
             raw_arch = chat.get("archive")
             if raw_arch is None:

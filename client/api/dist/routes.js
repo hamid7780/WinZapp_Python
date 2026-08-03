@@ -208,7 +208,7 @@ function createRouter(manager) {
     router.post('/api/:session/get-media-by-message/:msgId', authCheck, async (req, res) => {
         try {
             const { session, msgId } = req.params;
-            const base64Data = await manager.getMediaByMessage(session, msgId);
+            const base64Data = await manager.getMediaByMessage(session, msgId, req.body);
             return res.status(200).json({ status: 'SUCCESS', response: base64Data });
         }
         catch (err) {

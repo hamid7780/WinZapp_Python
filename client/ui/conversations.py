@@ -4218,6 +4218,22 @@ class ConversationsPanel(wx.Panel):
             tmp.write(content)
             tmp.close()
             self._audio_temp_file = tmp.name
+
+            # If audio file is OGG/Opus, convert to WAV via ffmpeg so BASS can play it natively on all sound cards
+            if content.startswith(b"OggS") or actual_ext in (".ogg", ".opus"):
+                find_ffmpeg = getattr(self.main_window, "_find_api_ffmpeg", None)
+                ffmpeg_bin = find_ffmpeg() if callable(find_ffmpeg) else None
+                if ffmpeg_bin and os.path.isfile(ffmpeg_bin):
+                    wav_tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+                    wav_tmp.close()
+                    try:
+                        cmd = [ffmpeg_bin, "-y", "-i", self._audio_temp_file, "-acodec", "pcm_s16le", "-ar", "44100", wav_tmp.name]
+                        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10)
+                        if res.returncode == 0 and os.path.isfile(wav_tmp.name) and os.path.getsize(wav_tmp.name) > 0:
+                            logging.info(f"[UI Audio Playback] Converted OGG to WAV using ffmpeg ({os.path.getsize(wav_tmp.name)} bytes)")
+                            self._audio_temp_file = wav_tmp.name
+                    except Exception as ex:
+                        logging.warning(f"[UI Audio Playback] ffmpeg OGG->WAV conversion failed: {ex}")
         except Exception as e:
             logging.exception(f"[UI Audio Playback] Error decrypting or creating temp audio file: {e}")
             self._stop_audio()

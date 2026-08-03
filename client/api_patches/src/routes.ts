@@ -219,7 +219,7 @@ export function createRouter(manager: BaileysManager): Router {
   router.post('/api/:session/get-media-by-message/:msgId', authCheck, async (req: Request, res: Response) => {
     try {
       const { session, msgId } = req.params;
-      const base64Data = await manager.getMediaByMessage(session, msgId);
+      const base64Data = await manager.getMediaByMessage(session, msgId, req.body);
       return res.status(200).json({ status: 'SUCCESS', response: base64Data });
     } catch (err: any) {
       return res.status(500).json({ status: 'ERROR', message: err.message });
