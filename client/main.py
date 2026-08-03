@@ -3439,26 +3439,26 @@ class MainWindow(wx.Frame):
             os.environ["PORT"] = str(self.wpp_port)
             os.environ["PUPPETEER_CACHE_DIR"] = resource_path("api", ".cache", "puppeteer")
 
-            # Ensure dist/config.js has useChrome:false so WPPConnect always uses
-            # Puppeteer's own bundled Chrome/Chromium instead of searching for a
-            # system Chrome installation. Patched here at runtime so existing users
-            # with a pre-built dist/ benefit immediately without a full rebuild.
-            try:
-                _dist_cfg = resource_path("api", "dist", "config.js")
-                if os.path.isfile(_dist_cfg):
-                    with open(_dist_cfg, "r", encoding="utf-8") as _f:
-                        _cfg_src = _f.read()
-                    if "useChrome" not in _cfg_src:
-                        _cfg_src = _cfg_src.replace(
-                            "createOptions: {",
-                            "createOptions: { useChrome: false,",
-                            1,
-                        )
-                        with open(_dist_cfg, "w", encoding="utf-8") as _f:
-                            _f.write(_cfg_src)
-                        logging.info("[startup] Patched dist/config.js: useChrome → false")
-            except Exception as _e:
-                logging.warning("[startup] Could not patch dist/config.js: %s", _e)
+            # Ensure client/api/dist/server.js is built with Baileys Gateway Server
+            dist_server = resource_path("api", "dist", "server.js")
+            need_setup = True
+            if os.path.isfile(dist_server):
+                try:
+                    with open(dist_server, "r", encoding="utf-8", errors="ignore") as f:
+                        src_head = f.read(2000)
+                    if "Baileys" in src_head or "baileys" in src_head or "BaileysManager" in src_head:
+                        need_setup = False
+                except Exception:
+                    need_setup = True
+
+            if need_setup:
+                logging.info("[startup] Baileys Gateway Server not found in dist/server.js — compiling via setup_api.py...")
+                try:
+                    setup_py = os.path.join(os.path.dirname(resource_path("api")), "setup_api.py")
+                    if os.path.isfile(setup_py):
+                        subprocess.run([sys.executable, setup_py], check=True, timeout=60)
+                except Exception as ex:
+                    logging.warning("[startup] Failed to auto-compile setup_api.py: %s", ex)
 
             # WPPConnect uses Puppeteer/Chrome which already includes --no-sandbox
             # in its config (see api/src/config.ts), so Chrome runs correctly even
@@ -5030,15 +5030,18 @@ class MainWindow(wx.Frame):
             resp = requests.get(
                 url,
                 headers={"Authorization": f"Bearer {self.token}"},
-                timeout=10,
+                timeout=5,
             )
             if resp.status_code in (200, 201):
                 data = resp.json()
-                if not data.get("status"):
-                    self._offline_probe_strikes = self._OFFLINE_PROBE_STRIKES
+                if data.get("status"):
+                    self._offline_probe_strikes = 0
+                    return True
+                else:
+                    self._offline_probe_strikes = getattr(self, "_OFFLINE_PROBE_STRIKES", 2)
                     return False
             elif resp.status_code == 404:
-                self._offline_probe_strikes = self._OFFLINE_PROBE_STRIKES
+                self._offline_probe_strikes = getattr(self, "_OFFLINE_PROBE_STRIKES", 2)
                 return False
         except Exception as e:
             logging.warning("[check_whatsapp_reachable] session probe failed: %s", e)
@@ -5047,9 +5050,8 @@ class MainWindow(wx.Frame):
             self._offline_probe_strikes = 0
             return True
         self._offline_probe_strikes = getattr(self, "_offline_probe_strikes", 0) + 1
-        if self._offline_probe_strikes >= self._OFFLINE_PROBE_STRIKES:
+        if self._offline_probe_strikes >= getattr(self, "_OFFLINE_PROBE_STRIKES", 2):
             return False
-        # First strike: give it one more cycle before going offline.
         return bool(getattr(self, "_wa_connected", False))
 
     def _is_pairing_dialog_active(self) -> bool:
