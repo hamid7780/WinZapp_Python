@@ -3200,42 +3200,50 @@ class MainWindow(wx.Frame):
                 logging.error("[ensure_api_modules_installed] Node.js download failed — node.exe still missing")
                 sys.exit(1)
 
-        # Detect and clean legacy node_modules from WPPConnect to force a clean install of WPPConnect
-        wpp_marker = os.path.join(node_modules, "@wppconnect-team")
-        if os.path.isdir(node_modules) and not os.path.isdir(wpp_marker):
-            logging.info("[ensure_api_modules_installed] Legacy node_modules detected. Cleaning for WPPConnect...")
-            try:
-                import shutil
-                shutil.rmtree(node_modules, ignore_errors=True)
-            except Exception as e:
-                logging.error("[ensure_api_modules_installed] Failed to remove legacy node_modules: %s", e)
-
-        # ── Check for new required packages in an existing node_modules ──────
-        # When we add a new npm dependency (e.g. @ffmpeg-installer/ffmpeg) the
-        # user's node_modules is already installed from a previous run, so the
-        # normal "node_modules absent" gate never fires. We compare a list of
-        # required package markers and run `npm install` silently in the
-        # background if any are missing — no dialog needed.
-        ffmpeg_bin = self._find_api_ffmpeg()
         _REQUIRED_MARKERS = [
             os.path.join(node_modules, "express"),
             os.path.join(node_modules, "@whiskeysockets", "baileys"),
             os.path.join(node_modules, "socket.io"),
         ]
 
-        missing = [m for m in _REQUIRED_MARKERS if not os.path.exists(m)]
-        if not os.path.isfile(dist_server) or missing:
-            logging.info("[ensure_api_modules_installed] Gateway server or dependencies missing (%s) — running setup_api.py...", missing)
-            try:
-                setup_script = os.path.join(os.path.dirname(resource_path("api")), "setup_api.py")
-                if not os.path.isfile(setup_script):
-                    setup_script = os.path.join(ROOT_DIR, "setup_api.py")
-                if os.path.isfile(setup_script):
-                    res = subprocess.run([sys.executable, setup_script], cwd=os.path.dirname(setup_script), timeout=180)
+        def _is_missing():
+            return not os.path.isfile(dist_server) or any(not os.path.exists(m) for m in _REQUIRED_MARKERS)
+
+        if _is_missing():
+            possible_paths = [
+                os.path.join(os.path.dirname(os.path.dirname(resource_path("api"))), "setup_api.py"),
+                os.path.join(os.path.dirname(resource_path("api")), "setup_api.py"),
+                os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "setup_api.py"),
+                resource_path("setup_api.py"),
+            ]
+            setup_script = next((p for p in possible_paths if os.path.isfile(p)), None)
+            
+            if setup_script:
+                logging.info("[ensure_api_modules_installed] Running setup_api.py from %s...", setup_script)
+                try:
+                    res = subprocess.run([sys.executable, setup_script], cwd=os.path.dirname(setup_script), check=True, timeout=300)
                     if res.returncode == 0:
                         logging.info("[ensure_api_modules_installed] setup_api.py completed successfully")
-            except Exception as e:
-                logging.error("[ensure_api_modules_installed] setup_api.py execution failed: %s", e)
+                except Exception as e:
+                    logging.error("[ensure_api_modules_installed] setup_api.py execution failed: %s", e)
+            else:
+                logging.error("[ensure_api_modules_installed] setup_api.py script not found!")
+
+        # Fallback inline npm install if dependencies are STILL missing after setup_api.py
+        if _is_missing():
+            logging.warning("[ensure_api_modules_installed] Dependencies still missing — executing direct inline npm install...")
+            node_exe = resource_path("node", "node.exe") if sys.platform == "win32" else (shutil.which("node") or "node")
+            npm_cli  = resource_path("node", "node_modules", "npm", "bin", "npm-cli.js") if sys.platform == "win32" else (shutil.which("npm") or "npm")
+            
+            if os.path.isfile(node_exe) and os.path.isfile(npm_cli):
+                cmd = [node_exe, npm_cli, "install", "--no-audit", "--no-fund"]
+            else:
+                cmd = ["npm", "install", "--no-audit", "--no-fund"]
+
+            try:
+                subprocess.run(cmd, cwd=resource_path("api"), check=True, timeout=300)
+            except Exception as ex:
+                logging.error("[ensure_api_modules_installed] Direct inline npm install failed: %s", ex)
 
     # ── WPPConnect version gate ───────────────────────────────────────────────
 
