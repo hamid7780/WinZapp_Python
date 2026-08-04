@@ -25,6 +25,57 @@ import makeWASocket, {
 } from '@whiskeysockets/baileys';
 import { Boom } from '@hapi/boom';
 
+function toNumber(t: any): number {
+  if (t === null || t === undefined) return 0;
+  if (typeof t === 'number') return t;
+  if (typeof t === 'string') return parseInt(t, 10);
+  if (typeof t === 'object') {
+    if (typeof t.toNumber === 'function') {
+      return t.toNumber();
+    }
+    if (typeof t.low === 'number') {
+      return t.low;
+    }
+  }
+  return Number(t);
+}
+
+function parseBuffer(val: any): Buffer | undefined {
+  if (!val) return undefined;
+  if (Buffer.isBuffer(val)) return val;
+  if (val instanceof Uint8Array) return Buffer.from(val);
+  if (typeof val === 'string') {
+    const clean = val.includes('base64,') ? val.split('base64,')[1] : val;
+    return Buffer.from(clean, 'base64');
+  }
+  if (typeof val === 'object') {
+    if (val.type === 'Buffer' && Array.isArray(val.data)) {
+      return Buffer.from(val.data);
+    }
+    if (Array.isArray(val)) {
+      return Buffer.from(val);
+    }
+  }
+  return undefined;
+}
+
+function getRealMessage(message: any): any {
+  if (!message) return {};
+  if (message.ephemeralMessage) {
+    return getRealMessage(message.ephemeralMessage.message);
+  }
+  if (message.viewOnceMessage) {
+    return getRealMessage(message.viewOnceMessage.message);
+  }
+  if (message.viewOnceMessageV2) {
+    return getRealMessage(message.viewOnceMessageV2.message);
+  }
+  if (message.documentWithCaptionMessage) {
+    return getRealMessage(message.documentWithCaptionMessage.message);
+  }
+  return message;
+}
+
 const logger = pino({ level: 'silent' });
 
 export class BaileysManager {
@@ -77,7 +128,11 @@ export class BaileysManager {
 
   public getStatus(session: string): string {
     const safeSession = this.getSafeSessionName(session);
-    return this.sessionStatus.get(safeSession) || 'DISCONNECTED';
+    const status = this.sessionStatus.get(safeSession);
+    if (!status || status === 'DISCONNECTED') {
+      return 'CLOSED';
+    }
+    return status;
   }
 
   public isConnected(session: string): boolean {
@@ -97,7 +152,31 @@ export class BaileysManager {
 
   public resolveLidToPhone(lid: string): string | undefined {
     const cleanLid = lid.replace('@c.us', '@s.whatsapp.net');
-    return this.lidToPhoneMap.get(cleanLid) || this.lidToPhoneMap.get(lid);
+    // 1. Check in-memory map
+    const cached = this.lidToPhoneMap.get(cleanLid) || this.lidToPhoneMap.get(lid);
+    if (cached) return cached;
+
+    // 2. Scan all stores/contacts
+    for (const [session, store] of this.stores.entries()) {
+      if (store && store.contacts) {
+        for (const id in store.contacts) {
+          const c = store.contacts[id];
+          if (c) {
+            const cleanId = id.replace('@c.us', '@s.whatsapp.net');
+            const cleanCLid = c.lid ? c.lid.replace('@c.us', '@s.whatsapp.net') : '';
+            if (cleanId === cleanLid && cleanCLid) {
+              this.lidToPhoneMap.set(cleanCLid, cleanId);
+              return cleanId;
+            }
+            if (cleanCLid === cleanLid) {
+              this.lidToPhoneMap.set(cleanLid, cleanId);
+              return cleanId;
+            }
+          }
+        }
+      }
+    }
+    return undefined;
   }
 
   public onClientConnected(socket: any): void {
@@ -177,7 +256,16 @@ export class BaileysManager {
     const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
     const { version } = await fetchLatestBaileysVersion();
 
+    const storeFile = path.join(sessionDir, 'baileys_store.json');
     const store = makeInMemoryStore({ logger });
+    if (fs.existsSync(storeFile)) {
+      try {
+        store.readFromFile(storeFile);
+        console.log(`[BaileysManager] Loaded store from ${storeFile}`);
+      } catch (e) {
+        console.error(`[BaileysManager] Failed to load store from ${storeFile}:`, e);
+      }
+    }
     this.stores.set(session, store);
 
     const sock = makeWASocket({
@@ -193,6 +281,67 @@ export class BaileysManager {
 
     store.bind(sock.ev);
     this.sessions.set(session, sock);
+
+    sock.ev.on('contacts.upsert', (contacts) => {
+      for (const c of contacts) {
+        if (c.id && c.lid) {
+          const phone = c.id.replace('@c.us', '@s.whatsapp.net');
+          const lid = c.lid.replace('@c.us', '@s.whatsapp.net');
+          this.lidToPhoneMap.set(lid, phone);
+        }
+      }
+    });
+
+    sock.ev.on('contacts.update', (contacts) => {
+      for (const c of contacts) {
+        if (c.id && c.lid) {
+          const phone = c.id.replace('@c.us', '@s.whatsapp.net');
+          const lid = c.lid.replace('@c.us', '@s.whatsapp.net');
+          this.lidToPhoneMap.set(lid, phone);
+        }
+      }
+    });
+
+    sock.ev.on('groups.upsert', (groups) => {
+      for (const group of groups) {
+        if (group.participants) {
+          for (const p of group.participants) {
+            if (p.id && p.lid) {
+              const phone = p.id.replace('@c.us', '@s.whatsapp.net');
+              const lid = p.lid.replace('@c.us', '@s.whatsapp.net');
+              this.lidToPhoneMap.set(lid, phone);
+            }
+          }
+        }
+      }
+    });
+
+    sock.ev.on('groups.update', (groups) => {
+      for (const group of groups) {
+        if (group.participants) {
+          for (const p of group.participants) {
+            if (p.id && p.lid) {
+              const phone = p.id.replace('@c.us', '@s.whatsapp.net');
+              const lid = p.lid.replace('@c.us', '@s.whatsapp.net');
+              this.lidToPhoneMap.set(lid, phone);
+            }
+          }
+        }
+      }
+    });
+
+    // Periodically save the store to file
+    const intervalId = setInterval(() => {
+      try {
+        if (this.sessions.has(session)) {
+          store.writeToFile(storeFile);
+        } else {
+          clearInterval(intervalId);
+        }
+      } catch (e) {
+        console.error(`[BaileysManager] Failed to write store to ${storeFile}:`, e);
+      }
+    }, 10000);
 
     // Save auth credentials whenever updated
     sock.ev.on('creds.update', saveCreds);
@@ -225,7 +374,7 @@ export class BaileysManager {
 
     // Handle Connection Updates
     sock.ev.on('connection.update', async (update) => {
-      const { connection, lastDisconnect, qr } = update;
+      const { connection, lastDisconnect, qr, receivedPendingNotifications } = update;
 
       if (qr) {
         try {
@@ -258,6 +407,15 @@ export class BaileysManager {
         this.io.emit('connection.update', connPayload);
         this.io.emit('session-logged', { status: true, session, data: connPayload.data });
         this.io.emit('status-find', { status: 'CONNECTED', session });
+        
+        // Defensive fallback: emit messages.set after 5 seconds if not triggered already
+        setTimeout(() => {
+          this.io.emit('messages.set', { session });
+        }, 5000);
+      }
+
+      if (receivedPendingNotifications) {
+        console.log(`[BaileysManager] receivedPendingNotifications for ${session}`);
         this.io.emit('messages.set', { session });
       }
 
@@ -331,7 +489,7 @@ export class BaileysManager {
         }
 
         // Cache LID to Phone mappings if participant / key available
-        if (msg.key.participant && msg.key.remoteJid) {
+        if (msg.key.participant && msg.key.remoteJid && !msg.key.remoteJid.endsWith('@g.us')) {
           if (msg.key.participant.includes('@lid')) {
             const phone = msg.key.remoteJid.replace('@c.us', '@s.whatsapp.net');
             this.lidToPhoneMap.set(msg.key.participant, phone);
@@ -351,7 +509,7 @@ export class BaileysManager {
         // Also emit WPPConnect style received-message for extra safety
         this.io.emit('received-message', {
           session,
-          response: this.formatWppMessage(msg)
+          response: this.formatWppMessage(msg, session)
         });
 
         // Handle reactions separately if reaction message
@@ -592,7 +750,7 @@ export class BaileysManager {
     if (!msg && reqBody && typeof reqBody === 'object') {
       const remoteJid = reqBody.remoteJid || reqBody.from || reqBody.key?.remoteJid || '';
       const fromMe = reqBody.fromMe ?? reqBody.key?.fromMe ?? false;
-      const mediaKey = reqBody.mediaKey ? Buffer.from(reqBody.mediaKey, 'base64') : undefined;
+      const mediaKey = parseBuffer(reqBody.mediaKey);
       const clientUrl = reqBody.clientUrl || reqBody.url || '';
       const directPath = reqBody.directPath || '';
       const mimetype = reqBody.mimetype || 'audio/ogg; codecs=opus';
@@ -617,6 +775,14 @@ export class BaileysManager {
 
     if (!msg) {
       throw new Error(`Message ${msgId} not found in gateway cache or payload`);
+    }
+
+    // Unwrap the message contents for downloading
+    if (msg && msg.message) {
+      msg = {
+        ...msg,
+        message: getRealMessage(msg.message)
+      };
     }
 
     const buffer = await downloadMediaMessage(
@@ -650,22 +816,35 @@ export class BaileysManager {
   public getChats(sessionRaw: string): any[] {
     const session = this.getSafeSessionName(sessionRaw);
     const store = this.stores.get(session);
+    const sock = this.sessions.get(session);
     const chats: any[] = [];
     const seenJids = new Set<string>();
 
     if (store && store.chats) {
       const allChats = store.chats.all();
       for (const c of allChats) {
-        if (!c.id || c.id === 'status@broadcast') continue;
+        if (!c.id || c.id.endsWith('@broadcast') || c.id.endsWith('@newsletter')) continue;
         const jid = this.normalizeJid(c.id);
         if (seenJids.has(jid)) continue;
         seenJids.add(jid);
+
+        const chatTs = toNumber(c.conversationTimestamp || (c as any).t || 0);
+
+        const isSelf = sock?.user?.id ? (this.normalizeJid(sock.user.id) === jid) : false;
+        const isWppSystem = jid.startsWith('0@');
+
+        if (isSelf || isWppSystem) {
+          const msgs = store.messages[c.id] || store.messages[jid] || [];
+          const hasMessages = Array.isArray(msgs) ? msgs.length > 0 : (msgs && typeof msgs === 'object' && Object.keys(msgs).length > 0);
+          if (!hasMessages && c.unreadCount === 0 && !c.pinned) {
+            continue;
+          }
+        }
 
         const contact = (store.contacts && store.contacts[c.id]) || (store.contacts && store.contacts[jid]) || {};
         const isGroup = jid.endsWith('@g.us');
         const name = c.name || (c as any).subject || contact.name || contact.notify || jid.split('@')[0];
 
-        const chatTs = Number(c.conversationTimestamp || (c as any).t || Math.floor(Date.now() / 1000));
         chats.push({
           id: { _serialized: jid },
           remoteJid: jid,
@@ -679,37 +858,13 @@ export class BaileysManager {
       }
     }
 
-    if (store && store.messages) {
-      for (const jidKey in store.messages) {
-        if (!jidKey || jidKey === 'status@broadcast') continue;
-        const jid = this.normalizeJid(jidKey);
-        if (seenJids.has(jid)) continue;
-        seenJids.add(jid);
-
-        const contact = (store.contacts && store.contacts[jidKey]) || (store.contacts && store.contacts[jid]) || {};
-        const isGroup = jid.endsWith('@g.us');
-        const name = contact.name || contact.notify || jid.split('@')[0];
-        const chatTs = Math.floor(Date.now() / 1000);
-
-        chats.push({
-          id: { _serialized: jid },
-          remoteJid: jid,
-          name: name,
-          pushName: contact.notify || contact.name || '',
-          unreadCount: 0,
-          isGroup: isGroup,
-          t: chatTs,
-          timestamp: chatTs
-        });
-      }
-    }
-
     return chats;
   }
 
   public getContacts(sessionRaw: string): any[] {
     const session = this.getSafeSessionName(sessionRaw);
     const store = this.stores.get(session);
+    const sock = this.sessions.get(session);
     const contacts: any[] = [];
 
     if (store && store.contacts) {
@@ -717,11 +872,15 @@ export class BaileysManager {
         if (!id || id.endsWith('@g.us') || id === 'status@broadcast') continue;
         const c = store.contacts[id];
         const jid = this.normalizeJid(id);
+        const isMe = sock?.user?.id ? (this.normalizeJid(sock.user.id) === jid) : false;
 
         contacts.push({
           id: { _serialized: jid },
           name: c.name || c.notify || jid.split('@')[0],
           pushname: c.notify || c.name || '',
+          pushName: c.notify || c.name || '',
+          isMyContact: true,
+          isMe,
           number: jid.split('@')[0]
         });
       }
@@ -730,27 +889,55 @@ export class BaileysManager {
     return contacts;
   }
 
-  public getMessages(sessionRaw: string, phoneInput: any): any[] {
+  public getContact(sessionRaw: string, jid: string): any {
+    const session = this.getSafeSessionName(sessionRaw);
+    const store = this.stores.get(session);
+    const cleanJid = this.normalizeJid(jid);
+    const sock = this.sessions.get(session);
+    const isMe = sock?.user?.id ? (this.normalizeJid(sock.user.id) === cleanJid) : false;
+
+    if (store && store.contacts) {
+      const contact = store.contacts[cleanJid] || store.contacts[jid] || {};
+      return {
+        id: { _serialized: cleanJid },
+        name: contact.name || contact.notify || cleanJid.split('@')[0],
+        pushname: contact.notify || contact.name || '',
+        pushName: contact.notify || contact.name || '',
+        isMyContact: true,
+        isMe,
+        number: cleanJid.split('@')[0]
+      };
+    }
+    return {
+      id: { _serialized: cleanJid },
+      name: cleanJid.split('@')[0],
+      pushname: cleanJid.split('@')[0],
+      pushName: cleanJid.split('@')[0],
+      isMyContact: false,
+      isMe,
+      number: cleanJid.split('@')[0]
+    };
+  }
+
+  public getMessages(sessionRaw: string, phoneInput: any, count?: number): any[] {
     const session = this.getSafeSessionName(sessionRaw);
     const store = this.stores.get(session);
     const jid = this.normalizeJid(phoneInput);
     if (!store || !store.messages) return [];
 
-    const rawMsgs = store.messages[jid] || store.messages[jid.replace('@s.whatsapp.net', '@c.us')] || [];
+    let rawMsgs = store.messages[jid] || store.messages[jid.replace('@s.whatsapp.net', '@c.us')] || [];
+    if (!Array.isArray(rawMsgs) && rawMsgs && typeof rawMsgs === 'object') {
+      rawMsgs = (rawMsgs as any).array || Object.values(rawMsgs);
+    }
+    if (!Array.isArray(rawMsgs)) rawMsgs = [];
+
+    const limit = count && count > 0 ? count : 200;
+    const sliced = rawMsgs.slice(-limit);
     const formatted: any[] = [];
 
-    if (Array.isArray(rawMsgs)) {
-      for (const m of rawMsgs) {
-        if (m && m.message) {
-          formatted.push(this.formatWppMessage(m));
-        }
-      }
-    } else if (rawMsgs && typeof rawMsgs === 'object') {
-      const msgsArr = (rawMsgs as any).array || Object.values(rawMsgs);
-      for (const m of msgsArr) {
-        if (m && (m as any).message) {
-          formatted.push(this.formatWppMessage(m as WAMessage));
-        }
+    for (const m of sliced) {
+      if (m && m.message) {
+        formatted.push(this.formatWppMessage(m, session));
       }
     }
 
@@ -786,6 +973,13 @@ export class BaileysManager {
     if (!phone) return '';
 
     phone = phone.trim();
+
+    // Strip device suffix (e.g. :89 or :1) from JIDs
+    if (phone.includes(':') && phone.includes('@')) {
+      const [local, domain] = phone.split('@');
+      phone = `${local.split(':')[0]}@${domain}`;
+    }
+
     if (phone.endsWith('@g.us') || phone.endsWith('@s.whatsapp.net')) {
       return phone;
     }
@@ -797,7 +991,7 @@ export class BaileysManager {
       return `${cleanNum}@s.whatsapp.net`;
     }
     if (phone.endsWith('@lid')) {
-      return this.lidToPhoneMap.get(phone) || phone;
+      return phone; // Keep LID canonical, do not resolve to phone number!
     }
 
     let clean = phone.replace(/[^0-9]/g, '');
@@ -825,8 +1019,8 @@ export class BaileysManager {
 
   private formatCanonicalMessage(msg: WAMessage): any {
     const key = msg.key;
-    const message = msg.message || {};
-    const messageType = Object.keys(message)[0] || 'conversation';
+    const realMessage = getRealMessage(msg.message || {});
+    const messageType = Object.keys(realMessage)[0] || 'conversation';
     const remoteJid = (key.remoteJid || '').replace('@c.us', '@s.whatsapp.net');
 
     return {
@@ -837,27 +1031,30 @@ export class BaileysManager {
         participant: key.participant ? key.participant.replace('@c.us', '@s.whatsapp.net') : undefined
       },
       pushName: msg.pushName || '',
-      message,
+      message: realMessage,
       messageType,
-      messageTimestamp: typeof msg.messageTimestamp === 'number' ? msg.messageTimestamp : Math.floor(Date.now() / 1000)
+      messageTimestamp: msg.messageTimestamp ? toNumber(msg.messageTimestamp) : Math.floor(Date.now() / 1000)
     };
   }
 
-  private formatWppMessage(msg: WAMessage): any {
+  private formatWppMessage(msg: WAMessage, session?: string): any {
     const key = msg.key;
     const remoteJid = (key.remoteJid || '').replace('@c.us', '@s.whatsapp.net');
     const msgId = key.id || '';
     const serializedId = `${key.fromMe}_${remoteJid}_${msgId}`;
 
-    const messageObj = msg.message || {};
-    const text = messageObj.conversation || messageObj.extendedTextMessage?.text || messageObj.imageMessage?.caption || messageObj.videoMessage?.caption || messageObj.documentMessage?.caption || '';
+    const sessionName = session || this.sessions.keys().next().value || 'default';
+    const myJid = this.normalizeJid(this.sessions.get(sessionName)?.user?.id || '');
 
-    const isAudio = Boolean(messageObj.audioMessage);
-    const isPtt = isAudio && Boolean(messageObj.audioMessage?.ptt !== false);
-    const isImage = Boolean(messageObj.imageMessage);
-    const isVideo = Boolean(messageObj.videoMessage);
-    const isDocument = Boolean(messageObj.documentMessage);
-    const isSticker = Boolean(messageObj.stickerMessage);
+    const realMessage = getRealMessage(msg.message || {});
+    const text = realMessage.conversation || realMessage.extendedTextMessage?.text || realMessage.imageMessage?.caption || realMessage.videoMessage?.caption || realMessage.documentMessage?.caption || '';
+
+    const isAudio = Boolean(realMessage.audioMessage);
+    const isPtt = isAudio && Boolean(realMessage.audioMessage?.ptt !== false);
+    const isImage = Boolean(realMessage.imageMessage);
+    const isVideo = Boolean(realMessage.videoMessage);
+    const isDocument = Boolean(realMessage.documentMessage);
+    const isSticker = Boolean(realMessage.stickerMessage);
 
     let type = 'chat';
     if (isPtt) type = 'ptt';
@@ -867,13 +1064,22 @@ export class BaileysManager {
     else if (isDocument) type = 'document';
     else if (isSticker) type = 'sticker';
 
-    const duration = messageObj.audioMessage?.seconds || messageObj.videoMessage?.seconds || 0;
-    const ts = typeof msg.messageTimestamp === 'number' ? msg.messageTimestamp : Math.floor(Date.now() / 1000);
+    const duration = realMessage.audioMessage?.seconds || realMessage.videoMessage?.seconds || 0;
+    const ts = msg.messageTimestamp ? toNumber(msg.messageTimestamp) : Math.floor(Date.now() / 1000);
+
+    const fromJid = key.fromMe ? myJid : remoteJid;
+    const toJid = key.fromMe ? remoteJid : myJid;
+
+    // Extract media fields for clientUrl, mediaKey, and directPath
+    const mediaMsg = realMessage.audioMessage || realMessage.imageMessage || realMessage.videoMessage || realMessage.documentMessage || realMessage.stickerMessage;
+    const mediaKey = mediaMsg?.mediaKey ? (Buffer.isBuffer(mediaMsg.mediaKey) ? mediaMsg.mediaKey.toString('base64') : (typeof mediaMsg.mediaKey === 'object' && mediaMsg.mediaKey.type === 'Buffer' ? Buffer.from(mediaMsg.mediaKey.data).toString('base64') : String(mediaMsg.mediaKey))) : '';
+    const clientUrl = mediaMsg?.url || '';
+    const directPath = mediaMsg?.directPath || '';
 
     return {
       id: { _serialized: serializedId, id: msgId, fromMe: key.fromMe || false, remote: remoteJid },
-      from: key.fromMe ? (this.sessions.get('default')?.user?.id || '') : (key.participant || remoteJid),
-      to: key.fromMe ? remoteJid : (this.sessions.get('default')?.user?.id || ''),
+      from: fromJid,
+      to: toJid,
       fromMe: key.fromMe || false,
       type,
       body: text,
@@ -881,9 +1087,18 @@ export class BaileysManager {
       text,
       duration,
       seconds: duration,
-      mimetype: messageObj.audioMessage?.mimetype || messageObj.imageMessage?.mimetype || messageObj.documentMessage?.mimetype || '',
+      mimetype: realMessage.audioMessage?.mimetype || realMessage.imageMessage?.mimetype || realMessage.documentMessage?.mimetype || '',
       t: ts,
-      timestamp: ts
+      timestamp: ts,
+      participant: key.participant || '',
+      author: key.participant || '',
+      clientUrl,
+      mediaKey,
+      directPath,
+      sender: {
+        id: key.fromMe ? myJid : (key.participant || remoteJid),
+        pushname: key.fromMe ? 'Me' : (msg.pushName || '')
+      }
     };
   }
 }

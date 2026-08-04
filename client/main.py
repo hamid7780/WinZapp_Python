@@ -5482,7 +5482,7 @@ class MainWindow(wx.Frame):
             #      locally, which on a reconnection means it is fully warmed up, or
             #  (c) we've exhausted retries.
             settled = server_count > 0 and server_count == prev_server_count
-            covers_cache = has_local_chats and server_count >= local_chat_count
+            covers_cache = has_local_chats and (server_count >= local_chat_count or server_count == 0)
             if settled or covers_cache:
                 chat_list_settled = True
                 break
@@ -5606,20 +5606,30 @@ class MainWindow(wx.Frame):
         # (previously fired directly on this background thread) visibly
         # outrunning the queued status-text clear.
         def _announce_messages_synced():
-            self._set_status("")
-            # Only announce completion when the chat list really came from the
-            # server — otherwise this is a partial sync that is about to be
-            # retried, and saying "conversations synchronized" over the few
-            # chats the socket delivered is exactly what makes the failure
-            # invisible to the user. …and only when that list had settled:
-            # announcing "conversations synchronized" over a chat list the
-            # server was still filling in is precisely what made the
-            # 3-or-4-conversations failure look like a success, right before
-            # the sync restarted itself.
-            if chat_list_ok and chat_list_settled:
-                self.sync_complete_sound.play()
-                if not self.background_mode:
-                    self.output(self.i18n.t("sync_complete"))
+            pending = len(getattr(self, "_chats_awaiting_messages", set()))
+            if not pending:
+                self._set_status("")
+                # Only announce completion when the chat list really came from the
+                # server — otherwise this is a partial sync that is about to be
+                # retried, and saying "conversations synchronized" over the few
+                # chats the socket delivered is exactly what makes the failure
+                # invisible to the user. …and only when that list had settled:
+                # announcing "conversations synchronized" over a chat list the
+                # server was still filling in is precisely what made the
+                # 3-or-4-conversations failure look like a success, right before
+                # the sync restarted itself.
+                if chat_list_ok and chat_list_settled:
+                    self.sync_complete_sound.play()
+                    if not self.background_mode:
+                        self.output(self.i18n.t("sync_complete"))
+            else:
+                lang = getattr(self.i18n, "current_language", "en-US")
+                if "pt" in lang.lower() or "es" in lang.lower():
+                    suffix = f"{pending} restantes"
+                else:
+                    suffix = f"{pending} remaining"
+                status_text = f"{self.i18n.t('synchronizing')}... ({suffix})"
+                self._set_status(status_text)
         wx.CallAfter(_announce_messages_synced)
 
         # Mark sync as done for this session so late-arriving messages.set
@@ -6707,15 +6717,15 @@ class MainWindow(wx.Frame):
         catch up, because the fallback was looking in the wrong place.
         """
         name = (chat.get("name") or "").strip()
-        if name:
+        if name and not MainWindow._is_bad_contact_name(name):
             return name
         subject = (chat.get("subject") or "").strip()
-        if subject:
+        if subject and not MainWindow._is_bad_contact_name(subject):
             return subject
         group_meta = chat.get("groupMetadata")
         if isinstance(group_meta, dict):
             gm_subject = (group_meta.get("subject") or "").strip()
-            if gm_subject:
+            if gm_subject and not MainWindow._is_bad_contact_name(gm_subject):
                 return gm_subject
         return ""
 
@@ -8276,9 +8286,14 @@ class MainWindow(wx.Frame):
         # concurrent requests fine; cap at 6 workers to avoid overloading it.
         max_workers = min(6, len(valid_chats))
         failed_count = 0
+        total_chats = len(valid_chats)
+        completed_chats = 0
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
             futs = {pool.submit(self.sync_chat_messages, c.copy()): c for c in valid_chats}
             for fut in as_completed(futs):
+                completed_chats += 1
+                status_text = f"{self.i18n.t('synchronizing')}... ({completed_chats}/{total_chats})"
+                wx.CallAfter(self._set_status, status_text)
                 try:
                     fut.result()
                 except Exception as exc:
@@ -8287,7 +8302,7 @@ class MainWindow(wx.Frame):
                     logging.warning("[sync_remote_chats] failed for %s: %s", jid, exc)
         logging.info(
             "[sync_remote_chats] done: %d chats, %d raised an exception",
-            len(valid_chats), failed_count,
+            total_chats, failed_count,
         )
 
     # Backfill pacing.  Adaptive rather than a fixed schedule: WhatsApp Web
@@ -8429,6 +8444,17 @@ class MainWindow(wx.Frame):
         delay = self._BACKFILL_FIRST_DELAY
         attempt = 0
         attempted: set[str] = set()
+
+        # Update status immediately on backfill startup
+        pending_init = sorted(getattr(self, "_chats_awaiting_messages", set()))
+        names_pending_init = self._pending_name_resolution()
+        total_init = len(pending_init) + len(names_pending_init)
+        if total_init:
+            lang = getattr(self.i18n, "current_language", "en-US")
+            suffix_init = f"{total_init} restantes" if ("pt" in lang.lower() or "es" in lang.lower()) else f"{total_init} remaining"
+            status_text = f"{self.i18n.t('synchronizing')}... ({suffix_init})"
+            wx.CallAfter(self._set_status, status_text)
+
         try:
             while time.monotonic() < deadline:
                 # Sleep in slices so a shutdown or a newer sync is noticed
@@ -8443,9 +8469,22 @@ class MainWindow(wx.Frame):
 
                 pending = sorted(getattr(self, "_chats_awaiting_messages", set()))
                 names_pending = self._pending_name_resolution()
-                if not pending and not names_pending:
+                total_pending = len(pending) + len(names_pending)
+                if not total_pending:
                     logging.info("[backfill] Nothing pending — every chat has history and a name.")
+                    wx.CallAfter(self._set_status, "")
+                    def _announce_backfill_complete():
+                        self.sync_complete_sound.play()
+                        if not self.background_mode:
+                            self.output(self.i18n.t("sync_complete"))
+                    wx.CallAfter(_announce_backfill_complete)
                     return
+                else:
+                    lang = getattr(self.i18n, "current_language", "en-US")
+                    suffix = f"{total_pending} restantes" if ("pt" in lang.lower() or "es" in lang.lower()) else f"{total_pending} remaining"
+                    status_text = f"{self.i18n.t('synchronizing')}... ({suffix})"
+                    wx.CallAfter(self._set_status, status_text)
+
                 if not getattr(self, "_wa_connected", False):
                     # Not a wasted pass: nothing was attempted, so just wait
                     # again rather than spending part of the budget on it.
@@ -8539,8 +8578,10 @@ class MainWindow(wx.Frame):
                     "[backfill] Budget spent with %d chat(s) still empty and %d still "
                     "unnamed — WhatsApp Web never resolved them this session.",
                     still, unnamed)
+                wx.CallAfter(self._set_status, "")
         except Exception:
             logging.exception("[backfill] Unhandled error in the backfill loop")
+            wx.CallAfter(self._set_status, "")
 
     def sync_media_for_all_chats(self):
         _MEDIA_TYPES = {"audioMessage", "documentMessage", "imageMessage",
@@ -9633,9 +9674,12 @@ class MainWindow(wx.Frame):
 
             result = subprocess.run(
                 [ffmpeg, "-y", "-i", wav_path,
+                 "-vn",
                  "-ac", "1",
-                 "-c:a", "libopus", "-b:a", "64k",
+                 "-ar", "16000",
+                 "-c:a", "libopus", "-b:a", "16k",
                  "-vbr", "on", "-compression_level", "10",
+                 "-application", "voip",
                  ogg_path],
                 capture_output=True,
                 timeout=60,
@@ -10578,13 +10622,31 @@ class MainWindow(wx.Frame):
 
         # Prepare body with media details to bypass Puppeteer cache lookups in WPPConnect Server
         body_data = dict(media)
-        msg_type = media.get("messageType")
         msg_inner_obj = media.get("message")
         if isinstance(msg_inner_obj, str):
             try:
                 msg_inner_obj = json.loads(msg_inner_obj)
             except Exception:
                 msg_inner_obj = None
+
+        def unwrap_message(m):
+            if not isinstance(m, dict):
+                return m
+            for wrap_key in ("ephemeralMessage", "viewOnceMessage", "viewOnceMessageV2", "documentWithCaptionMessage"):
+                if wrap_key in m and isinstance(m[wrap_key], dict):
+                    inner_m = m[wrap_key].get("message")
+                    if isinstance(inner_m, dict):
+                        return unwrap_message(inner_m)
+            return m
+
+        msg_inner_obj = unwrap_message(msg_inner_obj)
+
+        msg_type = None
+        if isinstance(msg_inner_obj, dict):
+            for k in msg_inner_obj.keys():
+                if k.endswith("Message"):
+                    msg_type = k
+                    break
 
         if not msg_type and media.get("type"):
             t = str(media.get("type"))
@@ -10608,6 +10670,7 @@ class MainWindow(wx.Frame):
                     body_data["directPath"] = inner["directPath"]
                 if "mimetype" in inner and inner["mimetype"]:
                     body_data["mimetype"] = inner["mimetype"]
+                body_data["messageType"] = msg_type
                 body_data["type"] = msg_type.replace("Message", "")
 
         has_media_key = bool(body_data.get("mediaKey"))
@@ -10646,7 +10709,8 @@ class MainWindow(wx.Frame):
                     logging.warning("[get_base64_from_media] HTTP %d (CDN expired) for %s", response.status_code, msg_id)
                     raise MediaExpiredError(response.status_code)
                 if response.status_code in (200, 201):
-                    b64 = response.json().get("base64", "")
+                    resp_json = response.json()
+                    b64 = resp_json.get("base64") or resp_json.get("response") or ""
                     logging.info("[get_base64_from_media] Success for %s — base64 len=%d", msg_id, len(b64))
                     return b64
 
@@ -10709,7 +10773,8 @@ class MainWindow(wx.Frame):
                                 progress_callback(downloaded / total)
                     body = b"".join(chunks).decode("utf-8", errors="replace")
                     try:
-                        return json.loads(body).get("base64", "")
+                        parsed = json.loads(body)
+                        return parsed.get("base64") or parsed.get("response") or ""
                     except Exception:
                         # Caso o body retornado seja o base64 bruto ou binário
                         return base64.b64encode(b"".join(chunks)).decode("utf-8")
@@ -11348,7 +11413,7 @@ class MainWindow(wx.Frame):
                 # 1s and, over a large batch of unresolved LIDs, doubling how
                 # long a fresh account spends with "Participante sem nome"
                 # showing in groups.
-                time.sleep(0.5)
+                time.sleep(0.01)
 
         if updated_contacts:
             try:
@@ -12978,10 +13043,15 @@ class MainWindow(wx.Frame):
             push       = last.get("pushName", "")
             if sender_jid.endswith("@g.us") and push and push.isdigit():
                 sender_jid = f"{push}@s.whatsapp.net"
+            
+            # Resolve LID JID to phone JID if mapped
+            lid_map = getattr(self, "_lid_to_phone", {})
+            resolved_sender = lid_map.get(sender_jid) or sender_jid
+            
             sender_name = (
-                self._resolve_contact_name({"remoteJid": sender_jid})
+                self._resolve_contact_name({"remoteJid": resolved_sender})
                 or (push if push and not is_phone_like(push) else "")
-                or self._preview_sender_from_jid(sender_jid)
+                or self._preview_sender_from_jid(resolved_sender)
             )
             sender_prefix = f"{sender_name}: " if sender_name else ""
         else:

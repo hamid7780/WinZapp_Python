@@ -1364,7 +1364,8 @@ class WebSocketClient:
                 "audioMessage": {
                     "url": wpp_msg.get("clientUrl", ""),
                     "seconds": seconds_val,
-                    "mediaKey": _safe_media_key(wpp_msg.get("mediaKey"))
+                    "mediaKey": _safe_media_key(wpp_msg.get("mediaKey")),
+                    "directPath": wpp_msg.get("directPath", "")
                 }
             }
         elif msg_type == "image":
@@ -1379,7 +1380,8 @@ class WebSocketClient:
                     "caption": img_caption,
                     "url": wpp_msg.get("clientUrl", ""),
                     "mimetype": wpp_msg.get("mimetype", "image/jpeg"),
-                    "mediaKey": _safe_media_key(wpp_msg.get("mediaKey"))
+                    "mediaKey": _safe_media_key(wpp_msg.get("mediaKey")),
+                    "directPath": wpp_msg.get("directPath", "")
                 }
             }
         elif msg_type == "video":
@@ -1400,7 +1402,8 @@ class WebSocketClient:
                     "gifPlayback": wpp_msg.get("isGif", False) or wpp_msg.get("gifPlayback", False),
                     "url": wpp_msg.get("clientUrl", ""),
                     "mimetype": wpp_msg.get("mimetype", "video/mp4"),
-                    "mediaKey": _safe_media_key(wpp_msg.get("mediaKey"))
+                    "mediaKey": _safe_media_key(wpp_msg.get("mediaKey")),
+                    "directPath": wpp_msg.get("directPath", "")
                 }
             }
         elif msg_type == "document":
@@ -1410,7 +1413,8 @@ class WebSocketClient:
                     "fileLength": wpp_msg.get("size") or wpp_msg.get("fileLength") or 0,
                     "url": wpp_msg.get("clientUrl", ""),
                     "mimetype": wpp_msg.get("mimetype", ""),
-                    "mediaKey": _safe_media_key(wpp_msg.get("mediaKey"))
+                    "mediaKey": _safe_media_key(wpp_msg.get("mediaKey")),
+                    "directPath": wpp_msg.get("directPath", "")
                 }
             }
         elif msg_type == "sticker":
@@ -1418,7 +1422,8 @@ class WebSocketClient:
                 "stickerMessage": {
                     "url": wpp_msg.get("clientUrl", ""),
                     "mimetype": wpp_msg.get("mimetype", "image/webp"),
-                    "mediaKey": _safe_media_key(wpp_msg.get("mediaKey"))
+                    "mediaKey": _safe_media_key(wpp_msg.get("mediaKey")),
+                    "directPath": wpp_msg.get("directPath", "")
                 }
             }
         elif msg_type in ("location", "liveLocation"):
@@ -1541,7 +1546,7 @@ class WebSocketClient:
                 "fromMe": from_me,
                 "id": clean_id
             },
-            "pushName": (wpp_msg.get("sender") or {}).get("pushname") or wpp_msg.get("notifyName") or "",
+            "pushName": wpp_msg.get("pushName") or (wpp_msg.get("sender") or {}).get("pushname") or wpp_msg.get("notifyName") or "",
             "message": message_content,
             "messageTimestamp": ts,
             "messageType": mapped_type,

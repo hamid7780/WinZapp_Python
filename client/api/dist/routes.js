@@ -217,27 +217,29 @@ function createRouter(manager) {
     });
     // Get Contact by LID
     router.get('/api/:session/contact/pn-lid/:lid', authCheck, (req, res) => {
-        const { lid } = req.params;
-        const phone = manager.resolveLidToPhone(lid) || lid;
+        const { session, lid } = req.params;
+        const phone = manager.resolveLidToPhone(lid);
+        const targetJid = phone || lid;
+        const contact = manager.getContact(session, targetJid);
         return res.status(200).json({
             status: 'SUCCESS',
             response: {
-                _serialized: phone,
-                user: phone.split('@')[0]
+                _serialized: phone || lid,
+                id: { _serialized: phone || lid },
+                user: (phone || lid).split('@')[0],
+                pnJid: phone || '',
+                phoneNumber: phone || '',
+                contact: contact
             }
         });
     });
     // Get Contact Info
     router.get('/api/:session/contact/:jid', authCheck, (req, res) => {
-        const { jid } = req.params;
-        const cleanJid = manager.normalizeJid(jid);
+        const { session, jid } = req.params;
+        const contact = manager.getContact(session, jid);
         return res.status(200).json({
             status: 'SUCCESS',
-            response: {
-                id: { _serialized: cleanJid },
-                name: cleanJid.split('@')[0],
-                pushname: cleanJid.split('@')[0]
-            }
+            response: contact
         });
     });
     // Group Info
@@ -278,7 +280,8 @@ function createRouter(manager) {
     // Get Messages
     router.get('/api/:session/get-messages/:phone', authCheck, (req, res) => {
         const { session, phone } = req.params;
-        const msgs = manager.getMessages(session, phone);
+        const count = req.query.count ? parseInt(String(req.query.count), 10) : undefined;
+        const msgs = manager.getMessages(session, phone, count);
         return res.status(200).json({ status: 'SUCCESS', response: msgs });
     });
     return router;
