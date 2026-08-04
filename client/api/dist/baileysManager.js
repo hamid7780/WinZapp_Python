@@ -450,32 +450,63 @@ class BaileysManager {
                 }
                 else if (shouldReconnect) {
                     this.sessionStatus.set(session, 'INITIALIZING');
-                    this.io.emit('status-find', { status: 'DISCONNECTED', session });
+                    this.io.emit('status-find', { status: 'INITIALIZING', session });
                     setTimeout(() => this.startSession(session), 3000);
                 }
             }
         });
         // Handle Messaging History Sync
-        sock.ev.on('messaging-history.set', ({ chats, contacts, messages }) => {
-            console.log(`[BaileysManager] messaging-history.set synced for ${session}: ${chats?.length || 0} chats, ${contacts?.length || 0} contacts, ${messages?.length || 0} messages`);
-            if (Array.isArray(messages)) {
-                for (const msg of messages) {
-                    if (!msg.message)
-                        continue;
-                    const msgId = msg.key.id || '';
-                    if (msgId) {
-                        this.messageCache.set(msgId, msg);
+        sock.ev.on('messaging-history.set', ({ chats, contacts, messages, isLatest }) => {
+            console.log(`[BaileysManager] messaging-history.set synced for ${session}: ${chats?.length || 0} chats, ${contacts?.length || 0} contacts, ${messages?.length || 0} messages, isLatest: ${isLatest}`);
+            if (Array.isArray(contacts)) {
+                for (const c of contacts) {
+                    if (c.id && c.lid) {
+                        const phone = c.id.replace('@s.whatsapp.net', '@c.us');
+                        const lid = c.lid.replace('@c.us', '@s.whatsapp.net');
+                        this.lidToPhoneMap.set(lid, phone);
                     }
-                    const canonicalMsg = this.formatCanonicalMessage(msg);
-                    canonicalMsg.isMdHistoryMsg = true;
-                    this.io.emit('messages.upsert', {
-                        event: 'messages.upsert',
-                        instance: session,
-                        data: canonicalMsg
-                    });
                 }
             }
-            this.io.emit('messages.set', { session });
+            if (Array.isArray(messages)) {
+                const batchSize = 50;
+                let index = 0;
+                const processBatch = () => {
+                    if (index >= messages.length) {
+                        if (isLatest === true || isLatest === undefined) {
+                            this.io.emit('messages.set', { session });
+                        }
+                        return;
+                    }
+                    const batch = messages.slice(index, index + batchSize);
+                    const formattedBatch = [];
+                    for (const msg of batch) {
+                        if (!msg.message)
+                            continue;
+                        const msgId = msg.key.id || '';
+                        if (msgId) {
+                            this.messageCache.set(msgId, msg);
+                        }
+                        const canonicalMsg = this.formatCanonicalMessage(msg);
+                        canonicalMsg.isMdHistoryMsg = true;
+                        formattedBatch.push(canonicalMsg);
+                    }
+                    if (formattedBatch.length > 0) {
+                        this.io.emit('messages.upsert', {
+                            event: 'messages.upsert',
+                            instance: session,
+                            data: formattedBatch
+                        });
+                    }
+                    index += batchSize;
+                    setImmediate(processBatch);
+                };
+                processBatch();
+            }
+            else {
+                if (isLatest === true || isLatest === undefined) {
+                    this.io.emit('messages.set', { session });
+                }
+            }
         });
         // Handle Messages Upsert
         sock.ev.on('messages.upsert', async (m) => {
@@ -503,11 +534,6 @@ class BaileysManager {
                     instance: session,
                     data: canonicalMsg
                 });
-                // Also emit WPPConnect style received-message for extra safety
-                this.io.emit('received-message', {
-                    session,
-                    response: this.formatWppMessage(msg, session)
-                });
                 // Handle reactions separately if reaction message
                 if (msg.message.reactionMessage) {
                     const rm = msg.message.reactionMessage;
@@ -527,36 +553,48 @@ class BaileysManager {
                 }
             }
         });
-        // Handle Messages Updates (ACKs)
+        // Handle Messages Updates (ACKs / Status Updates)
         sock.ev.on('messages.update', async (updates) => {
-            for (const u of updates) {
-                if (u.update.status) {
-                    const ackVal = this.baileysStatusToAck(u.update.status);
-                    const remoteJid = u.key.remoteJid || '';
-                    const msgId = u.key.id || '';
-                    const serializedId = `${u.key.fromMe}_${remoteJid}_${msgId}`;
-                    this.io.emit('onack', {
-                        session,
-                        id: { _serialized: serializedId, id: msgId, fromMe: u.key.fromMe, remote: remoteJid },
-                        ack: ackVal,
-                        to: remoteJid
-                    });
-                }
-            }
+            this.io.emit('messages.update', {
+                instance: session,
+                data: updates
+            });
         });
         // Handle Presence Updates
         sock.ev.on('presence.update', (pu) => {
-            const jid = pu.id;
-            const presences = pu.presences;
-            if (presences && presences[jid]) {
-                const p = presences[jid];
-                const statusStr = p.lastKnownPresence || 'offline';
-                this.io.emit('onpresencechanged', {
-                    session,
-                    id: jid,
-                    presence: statusStr
-                });
-            }
+            this.io.emit('presence.update', {
+                instance: session,
+                data: pu
+            });
+        });
+        // Handle Chats Update (unreadCount, pin, archive)
+        sock.ev.on('chats.update', (updates) => {
+            const mapped = updates.map((cu) => {
+                const jid = this.normalizeJid(cu.id);
+                const obj = {
+                    remoteJid: jid,
+                    id: jid
+                };
+                if (cu.unreadCount !== undefined)
+                    obj.unreadCount = cu.unreadCount;
+                if (cu.pinned !== undefined) {
+                    obj.pinned = cu.pinned;
+                }
+                else if (cu.pin !== undefined) {
+                    obj.pinned = cu.pin;
+                }
+                if (cu.archived !== undefined) {
+                    obj.archive = cu.archived;
+                }
+                else if (cu.archive !== undefined) {
+                    obj.archive = cu.archive;
+                }
+                return obj;
+            });
+            this.io.emit('chats.update', {
+                session,
+                data: mapped
+            });
         });
         return 'INITIALIZING';
     }
@@ -580,29 +618,18 @@ class BaileysManager {
         this.io.emit('status-find', { status: 'DISCONNECTED', session });
         return true;
     }
-    async sendMessage(sessionRaw, phone, text) {
+    async sendMessage(sessionRaw, phoneInput, messageText) {
         const session = this.getSafeSessionName(sessionRaw);
         const sock = this.sessions.get(session);
         if (!sock)
             throw new Error('Session not connected');
-        const jid = this.normalizeJid(phone);
-        // Snappy UX: slight human typing simulation (150ms)
+        const jid = this.normalizeJid(phoneInput);
         try {
             await sock.sendPresenceUpdate('composing', jid);
         }
         catch (e) { }
-        const sent = await sock.sendMessage(jid, { text });
-        const msgId = sent?.key?.id || '';
-        const serializedId = `true_${jid}_${msgId}`;
-        return [{
-                id: { _serialized: serializedId, id: msgId, fromMe: true, remote: jid },
-                from: sock.user?.id || '',
-                to: jid,
-                fromMe: true,
-                type: 'chat',
-                body: text,
-                timestamp: sent?.messageTimestamp || Math.floor(Date.now() / 1000)
-            }];
+        const sent = await sock.sendMessage(jid, { text: messageText });
+        return [this.formatCanonicalMessage(sent)];
     }
     async sendReply(sessionRaw, phone, text, quotedMsgId) {
         const session = this.getSafeSessionName(sessionRaw);
@@ -613,47 +640,66 @@ class BaileysManager {
         const cleanQuotedId = quotedMsgId.includes('_') ? quotedMsgId.split('_')[2] : quotedMsgId;
         const quotedMsg = this.messageCache.get(cleanQuotedId);
         const sent = await sock.sendMessage(jid, { text }, { quoted: quotedMsg });
-        const msgId = sent?.key?.id || '';
-        const serializedId = `true_${jid}_${msgId}`;
-        return [{
-                id: { _serialized: serializedId, id: msgId, fromMe: true, remote: jid },
-                from: sock.user?.id || '',
-                to: jid,
-                fromMe: true,
-                type: 'chat',
-                body: text,
-                timestamp: sent?.messageTimestamp || Math.floor(Date.now() / 1000)
-            }];
+        return [this.formatCanonicalMessage(sent)];
     }
-    async sendVoiceBase64(sessionRaw, phone, base64Data) {
+    async sendVoiceBase64(sessionRaw, phone, base64Data, duration) {
         const session = this.getSafeSessionName(sessionRaw);
         const sock = this.sessions.get(session);
         if (!sock)
             throw new Error('Session not connected');
-        const jid = this.normalizeJid(phone);
+        let jid = this.normalizeJid(phone);
         if (!base64Data)
             throw new Error('No base64 voice audio data provided');
         const cleanBase64 = base64Data.includes('base64,') ? base64Data.split('base64,')[1] : base64Data;
         const buffer = Buffer.from(cleanBase64, 'base64');
+        const isWav = buffer.subarray(0, 4).toString() === 'RIFF';
+        if (isWav) {
+            throw new Error('WAV audio is not supported for PTT voice messages — ffmpeg is required on the Python side to convert WAV to OGG/Opus before sending. Please ensure ffmpeg is available in client/lib/.');
+        }
+        const mimetype = 'audio/ogg; codecs=opus';
+        const waveform = new Uint8Array(64).fill(25);
         try {
             await sock.sendPresenceUpdate('recording', jid);
         }
         catch (e) { }
-        const sent = await sock.sendMessage(jid, {
-            audio: buffer,
-            ptt: true,
-            mimetype: 'audio/ogg; codecs=opus'
-        });
-        const msgId = sent?.key?.id || '';
-        const serializedId = `true_${jid}_${msgId}`;
-        return [{
-                id: { _serialized: serializedId, id: msgId, fromMe: true, remote: jid },
-                from: sock.user?.id || '',
-                to: jid,
-                fromMe: true,
-                type: 'ptt',
-                timestamp: sent?.messageTimestamp || Math.floor(Date.now() / 1000)
-            }];
+        let sent;
+        try {
+            sent = await sock.sendMessage(jid, {
+                audio: buffer,
+                ptt: true,
+                mimetype: mimetype,
+                seconds: duration || 0,
+                waveform: waveform
+            });
+        }
+        catch (sendErr) {
+            if (jid.endsWith('@lid')) {
+                // Fallback: resolve phone number if sending to @lid failed
+                try {
+                    const pn = this.resolveLidToPhone(jid);
+                    if (pn) {
+                        jid = this.normalizeJid(pn);
+                        sent = await sock.sendMessage(jid, {
+                            audio: buffer,
+                            ptt: true,
+                            mimetype: mimetype,
+                            seconds: duration || 0,
+                            waveform: waveform
+                        });
+                    }
+                    else {
+                        throw sendErr;
+                    }
+                }
+                catch (fbErr) {
+                    throw sendErr;
+                }
+            }
+            else {
+                throw sendErr;
+            }
+        }
+        return [this.formatCanonicalMessage(sent)];
     }
     async sendMediaBase64(sessionRaw, phone, base64Data, caption, isImage = true) {
         const session = this.getSafeSessionName(sessionRaw);
@@ -667,16 +713,7 @@ class BaileysManager {
             ? { image: buffer, caption: caption || '' }
             : { document: buffer, caption: caption || '', mimetype: 'application/octet-stream' };
         const sent = await sock.sendMessage(jid, content);
-        const msgId = sent?.key?.id || '';
-        const serializedId = `true_${jid}_${msgId}`;
-        return [{
-                id: { _serialized: serializedId, id: msgId, fromMe: true, remote: jid },
-                from: sock.user?.id || '',
-                to: jid,
-                fromMe: true,
-                type: isImage ? 'image' : 'document',
-                timestamp: sent?.messageTimestamp || Math.floor(Date.now() / 1000)
-            }];
+        return [this.formatCanonicalMessage(sent)];
     }
     async reactMessage(sessionRaw, msgId, reaction) {
         const session = this.getSafeSessionName(sessionRaw);
@@ -778,32 +815,48 @@ class BaileysManager {
             for (const c of allChats) {
                 if (!c.id || c.id.endsWith('@broadcast') || c.id.endsWith('@newsletter'))
                     continue;
-                const jid = this.normalizeJid(c.id);
+                let jid = this.normalizeJid(c.id);
+                const isGroup = jid.endsWith('@g.us');
+                if (jid.endsWith('@lid')) {
+                    const mappedPhone = this.lidToPhoneMap.get(jid);
+                    if (mappedPhone) {
+                        jid = mappedPhone;
+                    }
+                }
                 if (seenJids.has(jid))
                     continue;
                 seenJids.add(jid);
                 const chatTs = toNumber(c.conversationTimestamp || c.t || 0);
-                const isSelf = sock?.user?.id ? (this.normalizeJid(sock.user.id) === jid) : false;
                 const isWppSystem = jid.startsWith('0@');
-                if (isSelf || isWppSystem) {
-                    const msgs = store.messages[c.id] || store.messages[jid] || [];
+                const rawPin = c.pinned ?? c.pin;
+                const pinVal = rawPin ? (typeof rawPin === 'number' || typeof rawPin === 'boolean' ? rawPin : 1) : null;
+                const unread = c.unreadCount || 0;
+                if (isWppSystem) {
+                    continue;
+                }
+                // Phantom / Empty Chat Filter for 1:1 and Self chats
+                if (!isGroup) {
+                    const msgs = (store.messages && (store.messages[c.id] || store.messages[jid])) || [];
                     const hasMessages = Array.isArray(msgs) ? msgs.length > 0 : (msgs && typeof msgs === 'object' && Object.keys(msgs).length > 0);
-                    if (!hasMessages && c.unreadCount === 0 && !c.pinned) {
+                    const hasActivity = chatTs > 0 || hasMessages || unread > 0 || Boolean(pinVal);
+                    if (!hasActivity) {
                         continue;
                     }
                 }
                 const contact = (store.contacts && store.contacts[c.id]) || (store.contacts && store.contacts[jid]) || {};
-                const isGroup = jid.endsWith('@g.us');
                 const name = c.name || c.subject || contact.name || contact.notify || jid.split('@')[0];
                 chats.push({
-                    id: { _serialized: jid },
+                    id: jid,
                     remoteJid: jid,
                     name: name,
                     pushName: contact.notify || contact.name || '',
                     unreadCount: c.unreadCount || 0,
                     isGroup: isGroup,
+                    conversationTimestamp: chatTs,
                     t: chatTs,
-                    timestamp: chatTs
+                    timestamp: chatTs,
+                    pinned: pinVal,
+                    archived: Boolean(c.archived)
                 });
             }
         }
@@ -822,8 +875,9 @@ class BaileysManager {
                 const jid = this.normalizeJid(id);
                 const isMe = sock?.user?.id ? (this.normalizeJid(sock.user.id) === jid) : false;
                 contacts.push({
-                    id: { _serialized: jid },
+                    id: jid,
                     name: c.name || c.notify || jid.split('@')[0],
+                    notify: c.notify || c.name || '',
                     pushname: c.notify || c.name || '',
                     pushName: c.notify || c.name || '',
                     isMyContact: true,
@@ -843,8 +897,9 @@ class BaileysManager {
         if (store && store.contacts) {
             const contact = store.contacts[cleanJid] || store.contacts[jid] || {};
             return {
-                id: { _serialized: cleanJid },
+                id: cleanJid,
                 name: contact.name || contact.notify || cleanJid.split('@')[0],
+                notify: contact.notify || contact.name || '',
                 pushname: contact.notify || contact.name || '',
                 pushName: contact.notify || contact.name || '',
                 isMyContact: true,
@@ -853,8 +908,9 @@ class BaileysManager {
             };
         }
         return {
-            id: { _serialized: cleanJid },
+            id: cleanJid,
             name: cleanJid.split('@')[0],
+            notify: cleanJid.split('@')[0],
             pushname: cleanJid.split('@')[0],
             pushName: cleanJid.split('@')[0],
             isMyContact: false,
@@ -862,7 +918,7 @@ class BaileysManager {
             number: cleanJid.split('@')[0]
         };
     }
-    getMessages(sessionRaw, phoneInput, count) {
+    getMessages(sessionRaw, phoneInput, count, direction, beforeId) {
         const session = this.getSafeSessionName(sessionRaw);
         const store = this.stores.get(session);
         const jid = this.normalizeJid(phoneInput);
@@ -875,11 +931,33 @@ class BaileysManager {
         if (!Array.isArray(rawMsgs))
             rawMsgs = [];
         const limit = count && count > 0 ? count : 200;
-        const sliced = rawMsgs.slice(-limit);
+        let sliced = [];
+        if (direction === 'before' && beforeId) {
+            const bareId = beforeId.includes('_')
+                ? beforeId.split('_')[2] || beforeId
+                : beforeId;
+            let anchorIdx = -1;
+            for (let i = 0; i < rawMsgs.length; i++) {
+                const m = rawMsgs[i];
+                if (m && m.key && (m.key.id === bareId || m.key.id === beforeId)) {
+                    anchorIdx = i;
+                    break;
+                }
+            }
+            if (anchorIdx >= 0) {
+                sliced = rawMsgs.slice(Math.max(0, anchorIdx - limit), anchorIdx);
+            }
+            else {
+                sliced = rawMsgs.slice(-limit);
+            }
+        }
+        else {
+            sliced = rawMsgs.slice(-limit);
+        }
         const formatted = [];
         for (const m of sliced) {
             if (m && m.message) {
-                formatted.push(this.formatWppMessage(m, session));
+                formatted.push(this.formatCanonicalMessage(m));
             }
         }
         return formatted;
@@ -892,17 +970,7 @@ class BaileysManager {
         const jid = this.normalizeJid(phoneInput);
         const mentions = (mentionedJids || []).map((m) => this.normalizeJid(m));
         const sent = await sock.sendMessage(jid, { text, mentions });
-        const msgId = sent?.key?.id || '';
-        const serializedId = `true_${jid}_${msgId}`;
-        return [{
-                id: { _serialized: serializedId, id: msgId, fromMe: true, remote: jid },
-                from: sock.user?.id || '',
-                to: jid,
-                fromMe: true,
-                type: 'chat',
-                body: text,
-                timestamp: sent?.messageTimestamp || Math.floor(Date.now() / 1000)
-            }];
+        return [this.formatCanonicalMessage(sent)];
     }
     normalizeJid(phoneInput) {
         if (!phoneInput)
@@ -935,100 +1003,383 @@ class BaileysManager {
         }
         return `${clean}@s.whatsapp.net`;
     }
-    baileysStatusToAck(status) {
-        switch (status) {
-            case 1: // PENDING
-            case 2: // SERVER_ACK
-                return 1;
-            case 3: // DELIVERY_ACK
-                return 2;
-            case 4: // READ
-                return 3;
-            case 5: // PLAYED
-                return 4;
-            default:
-                return 1;
-        }
-    }
     formatCanonicalMessage(msg) {
+        if (!msg || !msg.key)
+            return null;
         const key = msg.key;
         const realMessage = getRealMessage(msg.message || {});
         const messageType = Object.keys(realMessage)[0] || 'conversation';
-        const remoteJid = (key.remoteJid || '').replace('@c.us', '@s.whatsapp.net');
+        let remoteJid = (key.remoteJid || '').replace('@c.us', '@s.whatsapp.net');
+        const participant = key.participant ? key.participant.replace('@c.us', '@s.whatsapp.net') : undefined;
+        // ── Resolve @lid → phone so live and sync paths key chats identically ──
+        // getChats() resolves @lid chat ids to their phone JID via lidToPhoneMap;
+        // if live messages kept the raw @lid, the Python client (whose own
+        // mapping cache starts empty and can only be filled from fields this
+        // gateway never used to emit) would create a NEW chat under @lid for every
+        // incoming 1:1 message while the real chat sits under the phone form —
+        // "new message spawns a duplicate chat" and the open conversation never
+        // updates. Resolve here, and surface the raw @lid as remoteJidAlt so the
+        // Python client can learn the mapping for future lookups too.
+        let remoteJidAlt;
+        if (remoteJid.endsWith('@lid')) {
+            const phone = this.resolveLidToPhone(remoteJid);
+            if (phone) {
+                remoteJidAlt = remoteJid;
+                remoteJid = phone.replace('@c.us', '@s.whatsapp.net');
+            }
+        }
+        let pushName = msg.pushName || '';
+        if (!pushName && participant) {
+            const senderJid = this.normalizeJid(participant);
+            for (const [sess, store] of this.stores.entries()) {
+                if (store && store.contacts) {
+                    const c = store.contacts[senderJid] || store.contacts[participant];
+                    if (c && (c.notify || c.name)) {
+                        pushName = c.notify || c.name;
+                        break;
+                    }
+                }
+            }
+        }
+        const keyOut = {
+            remoteJid,
+            fromMe: key.fromMe || false,
+            id: key.id || '',
+            participant
+        };
+        if (remoteJidAlt) {
+            keyOut.remoteJidAlt = remoteJidAlt;
+        }
         return {
-            key: {
-                remoteJid,
-                fromMe: key.fromMe || false,
-                id: key.id || '',
-                participant: key.participant ? key.participant.replace('@c.us', '@s.whatsapp.net') : undefined
-            },
-            pushName: msg.pushName || '',
+            key: keyOut,
+            pushName,
             message: realMessage,
             messageType,
             messageTimestamp: msg.messageTimestamp ? toNumber(msg.messageTimestamp) : Math.floor(Date.now() / 1000)
         };
     }
-    formatWppMessage(msg, session) {
-        const key = msg.key;
-        const remoteJid = (key.remoteJid || '').replace('@c.us', '@s.whatsapp.net');
-        const msgId = key.id || '';
-        const serializedId = `${key.fromMe}_${remoteJid}_${msgId}`;
-        const sessionName = session || this.sessions.keys().next().value || 'default';
-        const myJid = this.normalizeJid(this.sessions.get(sessionName)?.user?.id || '');
-        const realMessage = getRealMessage(msg.message || {});
-        const text = realMessage.conversation || realMessage.extendedTextMessage?.text || realMessage.imageMessage?.caption || realMessage.videoMessage?.caption || realMessage.documentMessage?.caption || '';
-        const isAudio = Boolean(realMessage.audioMessage);
-        const isPtt = isAudio && Boolean(realMessage.audioMessage?.ptt !== false);
-        const isImage = Boolean(realMessage.imageMessage);
-        const isVideo = Boolean(realMessage.videoMessage);
-        const isDocument = Boolean(realMessage.documentMessage);
-        const isSticker = Boolean(realMessage.stickerMessage);
-        let type = 'chat';
-        if (isPtt)
-            type = 'ptt';
-        else if (isAudio)
-            type = 'audio';
-        else if (isImage)
-            type = 'image';
-        else if (isVideo)
-            type = 'video';
-        else if (isDocument)
-            type = 'document';
-        else if (isSticker)
-            type = 'sticker';
-        const duration = realMessage.audioMessage?.seconds || realMessage.videoMessage?.seconds || 0;
-        const ts = msg.messageTimestamp ? toNumber(msg.messageTimestamp) : Math.floor(Date.now() / 1000);
-        const fromJid = key.fromMe ? myJid : remoteJid;
-        const toJid = key.fromMe ? remoteJid : myJid;
-        // Extract media fields for clientUrl, mediaKey, and directPath
-        const mediaMsg = realMessage.audioMessage || realMessage.imageMessage || realMessage.videoMessage || realMessage.documentMessage || realMessage.stickerMessage;
-        const mediaKey = mediaMsg?.mediaKey ? (Buffer.isBuffer(mediaMsg.mediaKey) ? mediaMsg.mediaKey.toString('base64') : (typeof mediaMsg.mediaKey === 'object' && mediaMsg.mediaKey.type === 'Buffer' ? Buffer.from(mediaMsg.mediaKey.data).toString('base64') : String(mediaMsg.mediaKey))) : '';
-        const clientUrl = mediaMsg?.url || '';
-        const directPath = mediaMsg?.directPath || '';
-        return {
-            id: { _serialized: serializedId, id: msgId, fromMe: key.fromMe || false, remote: remoteJid },
-            from: fromJid,
-            to: toJid,
-            fromMe: key.fromMe || false,
-            type,
-            body: text,
-            caption: text,
-            text,
-            duration,
-            seconds: duration,
-            mimetype: realMessage.audioMessage?.mimetype || realMessage.imageMessage?.mimetype || realMessage.documentMessage?.mimetype || '',
-            t: ts,
-            timestamp: ts,
-            participant: key.participant || '',
-            author: key.participant || '',
-            clientUrl,
-            mediaKey,
-            directPath,
-            sender: {
-                id: key.fromMe ? myJid : (key.participant || remoteJid),
-                pushname: key.fromMe ? 'Me' : (msg.pushName || '')
+    // ── Chat state ops (mute / pin / archive / clear / delete) ────────────────
+    // These endpoints were part of the old WPPConnect client surface but were
+    // never reimplemented after the Baileys gateway migration, so the Python
+    // client got HTTP 404 for every mute/pin/archive/clear and the 60s chat-list
+    // poll quietly reverted the local change ("app keeps breaking"). Baileys
+    // exposes chatModify for all of them, so they're implemented for real here.
+    async sendMute(sessionRaw, phone, timeVal, timeType, isGroup) {
+        const session = this.getSafeSessionName(sessionRaw);
+        const sock = this.sessions.get(session);
+        if (!sock)
+            throw new Error('Session not connected');
+        const jid = this.normalizeJid(phone);
+        // timeVal==0 means unmute. Otherwise compute an absolute mute-until
+        // timestamp in ms. WPPConnect's sendMute contract: time in units of
+        // timeType ('minutes'|'hours'); 0 = remove mute.
+        if (timeVal === 0) {
+            await sock.chatModify({ mute: null }, jid);
+        }
+        else {
+            const unitMs = timeType === 'minutes' ? 60_000 : 3_600_000;
+            const until = Date.now() + Math.round(Number(timeVal) * unitMs);
+            await sock.chatModify({ mute: until }, jid);
+        }
+        return [{ id: { _serialized: jid }, fromMe: true, remote: jid }];
+    }
+    async setPinChat(sessionRaw, phone, pinned) {
+        const session = this.getSafeSessionName(sessionRaw);
+        const sock = this.sessions.get(session);
+        if (!sock)
+            throw new Error('Session not connected');
+        const jid = this.normalizeJid(phone);
+        await sock.chatModify({ pin: pinned }, jid);
+        return [{ id: { _serialized: jid }, fromMe: true, remote: jid }];
+    }
+    async setArchiveChat(sessionRaw, phone, archived) {
+        const session = this.getSafeSessionName(sessionRaw);
+        const sock = this.sessions.get(session);
+        if (!sock)
+            throw new Error('Session not connected');
+        const jid = this.normalizeJid(phone);
+        // ChatModification's archive member also carries lastMessages; we don't need
+        // to alter messages, so pass an empty list. The union member is
+        // `{ archive: boolean; lastMessages: LastMessageList }` — providing both
+        // satisfies the type without casting.
+        await sock.chatModify({ archive: archived, lastMessages: [] }, jid);
+        return [{ id: { _serialized: jid }, fromMe: true, remote: jid }];
+    }
+    async clearChatMessages(sessionRaw, phone) {
+        const session = this.getSafeSessionName(sessionRaw);
+        const sock = this.sessions.get(session);
+        if (!sock)
+            throw new Error('Session not connected');
+        const jid = this.normalizeJid(phone);
+        await sock.chatModify({ clear: true }, jid);
+        return [{ id: { _serialized: jid }, fromMe: true, remote: jid }];
+    }
+    async deleteChatForEveryone(sessionRaw, phone) {
+        const session = this.getSafeSessionName(sessionRaw);
+        const sock = this.sessions.get(session);
+        if (!sock)
+            throw new Error('Session not connected');
+        const jid = this.normalizeJid(phone);
+        // Baileys has no first-class "delete whole chat" primitive; clear the
+        // store copy so the next list-chats no longer reports it.
+        const store = this.stores.get(session);
+        if (store && store.chats) {
+            try {
+                store.chats.deleteById(jid);
             }
-        };
+            catch (e) {
+                // ignore store shape differences
+            }
+        }
+        try {
+            await sock.chatModify({ delete: true, lastMessages: [] }, jid);
+        }
+        catch (e) {
+            // chatModify delete may not be supported server-side; the store removal
+            // above already hides it from the chat list.
+        }
+        return [{ id: { _serialized: jid }, fromMe: true, remote: jid }];
+    }
+    async getBlocklist(sessionRaw) {
+        const session = this.getSafeSessionName(sessionRaw);
+        const sock = this.sessions.get(session);
+        if (!sock)
+            return [];
+        const blocked = await sock.fetchBlocklist();
+        return Array.isArray(blocked) ? blocked.map((j) => ({ phone: j })) : [];
+    }
+    async setBlockContact(sessionRaw, phone, block) {
+        const session = this.getSafeSessionName(sessionRaw);
+        const sock = this.sessions.get(session);
+        if (!sock)
+            throw new Error('Session not connected');
+        const jid = this.normalizeJid(phone);
+        await sock.updateBlockStatus(jid, block ? 'block' : 'unblock');
+        return [{ id: { _serialized: jid }, fromMe: true, remote: jid }];
+    }
+    async sendTyping(sessionRaw, phone, value) {
+        const session = this.getSafeSessionName(sessionRaw);
+        const sock = this.sessions.get(session);
+        if (!sock)
+            throw new Error('Session not connected');
+        const jid = this.normalizeJid(phone);
+        await sock.sendPresenceUpdate(value ? 'composing' : 'paused', jid);
+        return [{ id: { _serialized: jid }, fromMe: true, remote: jid }];
+    }
+    async sendRecording(sessionRaw, phone, value) {
+        const session = this.getSafeSessionName(sessionRaw);
+        const sock = this.sessions.get(session);
+        if (!sock)
+            throw new Error('Session not connected');
+        const jid = this.normalizeJid(phone);
+        await sock.sendPresenceUpdate(value ? 'recording' : 'paused', jid);
+        return [{ id: { _serialized: jid }, fromMe: true, remote: jid }];
+    }
+    async sendSeen(sessionRaw, phone, msgId) {
+        const session = this.getSafeSessionName(sessionRaw);
+        const sock = this.sessions.get(session);
+        if (!sock)
+            return false;
+        const jid = this.normalizeJid(phone);
+        try {
+            if (msgId) {
+                const cleanId = msgId.includes('_') ? msgId.split('_')[2] : msgId;
+                const cachedMsg = this.messageCache.get(cleanId);
+                let keyToRead;
+                if (cachedMsg && cachedMsg.key) {
+                    keyToRead = cachedMsg.key;
+                }
+                else {
+                    keyToRead = {
+                        remoteJid: jid,
+                        id: cleanId,
+                        fromMe: false
+                    };
+                    if (jid.endsWith('@g.us') && cachedMsg?.key?.participant) {
+                        keyToRead.participant = cachedMsg.key.participant;
+                    }
+                }
+                await sock.readMessages([keyToRead]);
+                return true;
+            }
+            else {
+                const store = this.stores.get(session);
+                if (store && store.chats) {
+                    const c = store.chats.get(jid);
+                    if (c)
+                        c.unreadCount = 0;
+                }
+                let msgs = [];
+                if (store?.messages) {
+                    msgs = store.messages[jid] ||
+                        store.messages[jid.replace('@s.whatsapp.net', '@c.us')] ||
+                        store.messages[jid.replace('@s.whatsapp.net', '@lid')] ||
+                        store.messages[jid.replace('@c.us', '@s.whatsapp.net')] ||
+                        [];
+                }
+                const keysToRead = Array.isArray(msgs)
+                    ? msgs.filter((m) => m && m.key && !m.key.fromMe).map((m) => m.key)
+                    : [];
+                if (keysToRead.length > 0) {
+                    await sock.readMessages(keysToRead);
+                }
+                return true;
+            }
+        }
+        catch (err) {
+            return false;
+        }
+    }
+    async getLastSeen(sessionRaw, phone) {
+        const session = this.getSafeSessionName(sessionRaw);
+        const sock = this.sessions.get(session);
+        if (!sock)
+            return null;
+        const jid = this.normalizeJid(phone);
+        try {
+            const pres = sock.presences && sock.presences.get(jid);
+            if (pres && typeof pres.lastSeen === 'number') {
+                return { t: pres.lastSeen };
+            }
+        }
+        catch (e) {
+            // presence store not populated — fall through
+        }
+        return null;
+    }
+    async getProfileStatus(sessionRaw, phone) {
+        const session = this.getSafeSessionName(sessionRaw);
+        const sock = this.sessions.get(session);
+        if (!sock)
+            return '';
+        const jid = this.normalizeJid(phone);
+        try {
+            const results = await sock.fetchStatus(jid);
+            if (Array.isArray(results) && results[0]) {
+                const st = results[0].status;
+                return st || '';
+            }
+        }
+        catch (e) {
+            // fall through to ''
+        }
+        return '';
+    }
+    async leaveGroup(sessionRaw, groupId) {
+        const session = this.getSafeSessionName(sessionRaw);
+        const sock = this.sessions.get(session);
+        if (!sock)
+            throw new Error('Session not connected');
+        const jid = this.normalizeJid(groupId);
+        await sock.groupLeave(jid);
+        return [{ id: { _serialized: jid }, fromMe: true, remote: jid }];
+    }
+    async addGroupParticipants(sessionRaw, groupId, participantIds) {
+        const session = this.getSafeSessionName(sessionRaw);
+        const sock = this.sessions.get(session);
+        if (!sock)
+            throw new Error('Session not connected');
+        const jid = this.normalizeJid(groupId);
+        const jids = (participantIds || []).map((p) => this.normalizeJid(p));
+        await sock.groupParticipantsUpdate(jid, jids, 'add');
+        return { groupId: jid, participants: jids };
+    }
+    async deleteMessageForEveryone(sessionRaw, phone, messageId, onlyLocal) {
+        const session = this.getSafeSessionName(sessionRaw);
+        const sock = this.sessions.get(session);
+        if (!sock)
+            throw new Error('Session not connected');
+        const jid = this.normalizeJid(phone);
+        // messageId is the fully-serialized id (`<fromMe>_<chat>_<id>[_<participant>]`).
+        const parts = String(messageId).split('_');
+        const fromMe = parts[0] === 'true';
+        const remoteJid = parts.length > 1 ? parts[1] : jid;
+        const cleanId = parts.length > 2 ? parts[2] : messageId;
+        const key = { remoteJid, fromMe, id: cleanId };
+        if (onlyLocal) {
+            await sock.chatModify({
+                deleteForMe: { deleteMedia: true, key, timestamp: Math.floor(Date.now() / 1000) }
+            }, jid);
+        }
+        else {
+            await sock.sendMessage(jid, { delete: key });
+        }
+        return { key };
+    }
+    async editMessageForEveryone(sessionRaw, phone, messageId, newText, options) {
+        const session = this.getSafeSessionName(sessionRaw);
+        const sock = this.sessions.get(session);
+        if (!sock)
+            throw new Error('Session not connected');
+        const jid = this.normalizeJid(phone);
+        const parts = String(messageId).split('_');
+        const fromMe = parts[0] === 'true';
+        const remoteJid = parts.length > 1 ? parts[1] : jid;
+        const cleanId = parts.length > 2 ? parts[2] : messageId;
+        const key = { remoteJid, fromMe, id: cleanId };
+        const content = { text: newText, edit: key };
+        if (options && options.mentionedJidList && Array.isArray(options.mentionedJidList)) {
+            content.mentions = options.mentionedJidList.map((m) => this.normalizeJid(m));
+        }
+        await sock.sendMessage(jid, content);
+        return { key };
+    }
+    async forwardMessages(sessionRaw, phone, messageIds) {
+        const session = this.getSafeSessionName(sessionRaw);
+        const sock = this.sessions.get(session);
+        if (!sock)
+            throw new Error('Session not connected');
+        const jid = this.normalizeJid(phone);
+        const store = this.stores.get(session);
+        const forwarded = [];
+        for (const fullId of (messageIds || [])) {
+            const parts = String(fullId).split('_');
+            const cleanId = parts.length > 2 ? parts[2] : fullId;
+            let source = this.messageCache.get(cleanId) || this.messageCache.get(fullId);
+            if (!source && store && store.messages) {
+                for (const jidKey in store.messages) {
+                    const msgs = store.messages[jidKey];
+                    if (Array.isArray(msgs)) {
+                        source = msgs.find((m) => m.key?.id === cleanId);
+                        if (source)
+                            break;
+                    }
+                }
+            }
+            if (!source)
+                continue;
+            const sent = await sock.sendMessage(jid, { forward: source });
+            if (sent)
+                forwarded.push(sent.key?.id || '');
+        }
+        return forwarded.map((id) => ({ id: { _serialized: id }, fromMe: true, remote: jid }));
+    }
+    async sendContactVCard(sessionRaw, phone, contactsIds) {
+        const session = this.getSafeSessionName(sessionRaw);
+        const sock = this.sessions.get(session);
+        if (!sock)
+            throw new Error('Session not connected');
+        const jid = this.normalizeJid(phone);
+        const store = this.stores.get(session);
+        const contacts = (contactsIds || []).map((cid) => {
+            const clean = this.normalizeJid(cid);
+            let name = clean.split('@')[0];
+            if (store && store.contacts) {
+                const c = store.contacts[clean] || store.contacts[cid];
+                if (c)
+                    name = c.name || c.notify || name;
+            }
+            return { displayName: name, vcard: `BEGIN:VCARD\nVERSION:3.0\nFN:${name}\nEND:VCARD` };
+        });
+        const sent = await sock.sendMessage(jid, {
+            contacts: { displayName: contacts[0]?.displayName || '', contacts }
+        });
+        const msgId = sent?.key?.id || '';
+        const serializedId = `true_${jid}_${msgId}`;
+        return [{
+                id: { _serialized: serializedId, id: msgId, fromMe: true, remote: jid },
+                from: sock.user?.id || '', to: jid, fromMe: true, type: 'contact'
+            }];
     }
 }
 exports.BaileysManager = BaileysManager;

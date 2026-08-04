@@ -2050,6 +2050,41 @@ class MainWindow(wx.Frame):
             return jid[:-5] + "@s.whatsapp.net"
         return jid
 
+    @staticmethod
+    def _ts_normalized(val) -> int:
+        """Coerce a WhatsApp timestamp to whole seconds.
+
+        WPPConnect's list-chats can report `t` in milliseconds (~1.7e12) while
+        message timestamps are in seconds (~1.7e9). Every spot that compares
+        two of these (on_new_message's sort bump, _chat_last_ts's sort key, the
+        get_remote_chats poll's monotonic guard) must normalize the same way or
+        a live message in seconds always looks "older" than a stored ms `t` and
+        the chat never floats. Returns 0 for junk so callers can treat it as
+        "no timestamp".
+        """
+        try:
+            val = int(val or 0)
+        except (TypeError, ValueError):
+            return 0
+        if val > 1_000_000_000_000:
+            val //= 1000
+        return val
+
+    def _canonical_jid(self, jid: str) -> str:
+        """Return the single canonical JID form for a conversation: @lid → its
+        resolved @s.whatsapp.net (falling back to the @lid itself), @c.us →
+        @s.whatsapp.net, everything else unchanged. Every chat-list key, sort
+        compare and pin lookup must use THIS form so one contact is never keyed
+        or compared under two different strings."""
+        j = self._normalize_jid(jid or "")
+        if not j:
+            return j
+        if j.endswith("@lid"):
+            phone = getattr(self, "_lid_to_phone", {}).get(j, "")
+            if phone:
+                return self._normalize_jid(phone)
+        return j
+
     def _merge_lid_into_phone(self, lid_jid: str, phone_jid: str):
         """Merge a @lid chat entry into the canonical phone (@s.whatsapp.net) entry.
 
@@ -2059,15 +2094,56 @@ class MainWindow(wx.Frame):
         """
         if lid_jid not in self.chats:
             return
+        src = self.chats[lid_jid]
+
+        def _merge_state_into(dst: dict):
+            """Copy every piece of per-chat state from `src` into `dst` that
+            `dst` is missing, and merge counts/timestamps rather than
+            overwriting. Previously only message records were copied, so a
+            merge lost the source's sort timestamp, unread count, preview,
+            and display name — the surviving chat kept a stale position/unread
+            and the merged-away state lingered invisibly."""
+            # Display name / pushName: only fill if the destination lacks one.
+            if not (dst.get("name") or "").strip() and (src.get("name") or "").strip():
+                dst["name"] = src.get("name")
+            if not (dst.get("pushName") or "").strip() and (src.get("pushName") or "").strip():
+                dst["pushName"] = src.get("pushName")
+            # Newest message serves as the sort floor.
+            def _ts(chat):
+                val = int(chat.get("t", 0) or 0)
+                if val > 1_000_000_000_000:
+                    val //= 1000
+                return val
+            src_ts = _ts(src)
+            dst_ts = _ts(dst)
+            if src_ts > dst_ts:
+                dst["t"] = src.get("t")
+            # Newer lastMessage wins.
+            def _lm_ts(chat):
+                lm = chat.get("lastMessage")
+                if not isinstance(lm, dict):
+                    return 0
+                val = int(lm.get("messageTimestamp") or lm.get("timestamp") or lm.get("t") or 0)
+                if val > 1_000_000_000_000:
+                    val //= 1000
+                return val
+            if _lm_ts(src) > _lm_ts(dst) and isinstance(src.get("lastMessage"), dict):
+                dst["lastMessage"] = src.get("lastMessage")
+            # Unread counts add up (both sides may hold distinct unread msgs).
+            dst["unreadCount"] = int(dst.get("unreadCount", 0) or 0) + int(
+                src.get("unreadCount", 0) or 0
+            )
+
         if phone_jid in self.chats:
+            dst = self.chats[phone_jid]
             dst_records = (
-                self.chats[phone_jid]
+                dst
                 .setdefault("messages", {})
                 .setdefault("messages", {})
                 .setdefault("records", [])
             )
             src_records = (
-                self.chats[lid_jid]
+                src
                 .get("messages", {})
                 .get("messages", {})
                 .get("records", [])
@@ -2076,12 +2152,43 @@ class MainWindow(wx.Frame):
             for r in src_records:
                 if r.get("key", {}).get("id") not in dst_ids:
                     dst_records.append(r)
+            _merge_state_into(dst)
         else:
-            lid_chat = self.chats.pop(lid_jid)
-            lid_chat["remoteJid"] = phone_jid
-            self.chats[phone_jid] = lid_chat
+            self.chats.pop(lid_jid, None)
+            src["remoteJid"] = phone_jid
+            self.chats[phone_jid] = src
         self.chats.pop(lid_jid, None)
-        
+
+        # ── Re-key the metadata sets so pin/mute/archive state survives the
+        # ── merge under the surviving phone JID instead of being stranded
+        # ── under the now-removed @lid key.
+        def _rekey(set_attr):
+            s = getattr(self, set_attr, None)
+            if s is None:
+                return
+            if lid_jid in s:
+                s.discard(lid_jid)
+                s.add(phone_jid)
+        _rekey("_pinned_chats")
+        _rekey("_archived_chats")
+        _rekey("_deleted_chats")
+        muted = getattr(self, "_muted_chats", None)
+        if muted and lid_jid in muted:
+            muted[phone_jid] = muted.pop(lid_jid)
+        group_cache = getattr(self, "_group_name_cache", None)
+        if group_cache and lid_jid in group_cache:
+            group_cache[phone_jid] = group_cache.pop(lid_jid)
+
+        # Persist the re-keyed metadata so a restart rehydrates it under the
+        # canonical form.
+        if hasattr(self, "db") and self.db is not None:
+            try:
+                self.db.set_metadata_json("pinned_chats", list(self._pinned_chats))
+                self.db.set_metadata_json("archived_chats", list(self._archived_chats))
+                self.db.set_metadata_json("deleted_chats", list(self._deleted_chats))
+            except Exception as meta_err:
+                logging.error(f"[merge_lid] Failed to persist re-keyed metadata: {meta_err}")
+
         def _bg_delete_chat():
             try:
                 self.db.delete_chat(lid_jid)
@@ -2098,6 +2205,63 @@ class MainWindow(wx.Frame):
                 wx.CallAfter(self.conversations_panel.refresh_messages_if_changed)
             elif active_jid == phone_jid:
                 wx.CallAfter(self.conversations_panel.refresh_messages_if_changed)
+
+    def _reconcile_canonical_jid(self, remote_jid: str) -> str:
+        """Route *remote_jid* to the canonical chat if one already exists.
+
+        Called at the top of both message funnels (on_new_message,
+        on_historical_message). The LID-resolution blocks those methods run
+        before this one only merge when the @lid↔phone mapping cache happens to
+        be populated at that instant; when it misses, a fresh chat would
+        otherwise be created under the incoming JID form while the contact's
+        real chat sits under the other form — the "new messages spawn a
+        duplicate chat" report.
+
+        This resolves the incoming JID to its canonical form and, if that
+        conversation already exists under either its phone or @lid key, merges
+        away the duplicate and returns the canonical JID so the caller stores
+        the message under the one true entry. Falls back to returning
+        *remote_jid* unchanged when no canonical counterpart exists.
+        """
+        if not remote_jid:
+            return remote_jid
+        canonical = self._canonical_jid(remote_jid)
+        if not canonical:
+            return remote_jid
+
+        # If canonical is still @lid, check DB or contacts for phone mapping before giving up
+        if canonical.endswith("@lid"):
+            phone = ""
+            db_obj = getattr(self, "db", None)
+            if db_obj is not None and callable(getattr(db_obj, "get_lid_mapping", None)):
+                try:
+                    phone = db_obj.get_lid_mapping(canonical) or ""
+                except Exception:
+                    pass
+            if not phone:
+                c_map = getattr(self, "contacts", {})
+                if isinstance(c_map, dict):
+                    c = c_map.get(canonical) or {}
+                    phone = c.get("phoneJid") or c.get("phoneNumber") or ""
+            if phone:
+                phone_norm = self._normalize_jid(phone)
+                self.register_jid_mapping(canonical, phone_norm)
+                canonical = phone_norm
+
+        lid_alt = (getattr(self, "_phone_to_lid", {}).get(canonical, "")
+                   if canonical.endswith("@s.whatsapp.net") else "")
+        existing_phone = canonical in self.chats
+        existing_lid = bool(lid_alt) and lid_alt in self.chats
+        if existing_phone or existing_lid:
+            if existing_lid:
+                # A @lid copy exists — collapse it into the phone entry
+                # (also migrates its pin/mute/archive/unread state).
+                self._merge_lid_into_phone(lid_alt, canonical)
+            if remote_jid != canonical:
+                if remote_jid in self.chats:
+                    self._merge_lid_into_phone(remote_jid, canonical)
+                return canonical
+        return remote_jid
 
     def _apply_remote_revoke(self, existing: dict, incoming: dict, remote_jid: str) -> bool:
         """Detect a "delete for everyone" (protocolMessage type 3/REVOKE)
@@ -2228,6 +2392,24 @@ class MainWindow(wx.Frame):
             return False
         return getattr(self, "_sync_ever_started", False)
 
+    def _history_events_ready(self) -> bool:
+        """True once it is safe to accept a full-history backfill message.
+
+        Looser than _live_events_ready(): on_historical_message() only appends
+        a record, sorts it, and updates lastMessage/t — it never bumps unread,
+        plays a sound, fires a notification, or touches the conversation list
+        position. So it is safe as soon as self.chats/self.db exist, even before
+        the sync thread has latched _sync_ever_started.
+
+        That distinction matters for history completeness: the messaging-history
+        full stream (isMdHistoryMsg=true) can start the instant the socket
+        connects, before start_sync() latches. _live_events_ready() would drop
+        those messages, and since the sync re-fetches only the newest
+        `messages_page_size` per chat, old messages arriving that early were
+        lost permanently — "history doesn't load like the phone."
+        """
+        return self._ui_ready_event.is_set()
+
     def on_new_message(self, msg: dict):
         """
         Called on the main thread (via wx.CallAfter) when a new message
@@ -2293,6 +2475,18 @@ class MainWindow(wx.Frame):
         # to normalize it), and redirecting to it as-is created yet another
         # duplicate "Eu" chat under @c.us instead of the canonical @s.whatsapp.net one.
         my_jid = self._normalize_jid(getattr(self, "my_jid", ""))
+        if not my_jid and from_me:
+            # Try to learn our own JID from this outgoing message's participant
+            if participant_raw and participant_raw.endswith("@s.whatsapp.net"):
+                my_jid = self._normalize_jid(participant_raw)
+                self.my_jid = my_jid
+                if hasattr(self, 'db') and self.db:
+                    try:
+                        self.db.set_metadata("my_jid", my_jid)
+                    except Exception:
+                        pass
+                logging.info("[on_new_message] Learned my_jid=%s from outgoing message participant", my_jid)
+
         my_lid = getattr(self, "my_lid", "")
         is_group_jid = remote_jid.endswith("@g.us")
 
@@ -2397,13 +2591,25 @@ class MainWindow(wx.Frame):
                         pn_resp = requests.get(pn_url, headers=headers, timeout=5)
                         if pn_resp.ok:
                             pn_data = pn_resp.json()
-                            phone_obj = pn_data.get("phoneNumber") or {}
-                            phone_val = phone_obj.get("_serialized") or phone_obj.get("id") or ""
+                            # The gateway nests everything under "response" and
+                            # returns phoneNumber/pnJid/_serialized as a plain
+                            # JID string, NOT as an object — reading them from
+                            # the top level (the old code) always produced "".
+                            resp = pn_data.get("response") if isinstance(pn_data, dict) else None
+                            if not isinstance(resp, dict):
+                                resp = pn_data if isinstance(pn_data, dict) else {}
+                            phone_val = (resp.get("pnJid") or resp.get("_serialized") or "").strip()
+                            if not phone_val:
+                                pn = resp.get("phoneNumber")
+                                if isinstance(pn, str):
+                                    phone_val = pn.strip()
+                                elif isinstance(pn, dict):
+                                    phone_val = pn.get("_serialized") or pn.get("id") or ""
                             if phone_val:
                                 if not phone_val.endswith("@s.whatsapp.net") and not phone_val.endswith("@c.us"):
                                     phone_val = f"{phone_val}@s.whatsapp.net"
                                 phone_val = self._normalize_jid(phone_val)
-                                
+
                                 # Register mapping and merge on the main thread
                                 def _main_thread_merge():
                                     self.register_jid_mapping(lid_jid, phone_val)
@@ -2421,6 +2627,12 @@ class MainWindow(wx.Frame):
             lid_jid = getattr(self, "_phone_to_lid", {}).get(remote_jid, "")
             if lid_jid:
                 self._merge_lid_into_phone(lid_jid, remote_jid)
+
+        # Reconcile the incoming JID to its canonical chat if one already
+        # exists under the other form — the in-session dedup that stops a
+        # message from spawning a duplicate chat when the mapping cache was
+        # momentarily empty.
+        remote_jid = self._reconcile_canonical_jid(remote_jid)
 
         # A conversation the user deleted comes back the moment it receives a
         # new message — that is what WhatsApp itself does.  Without lifting the
@@ -2459,14 +2671,20 @@ class MainWindow(wx.Frame):
 
         chat = self.chats[remote_jid]
         
-        msg_ts = int(msg.get("messageTimestamp", 0) or msg.get("t", 0) or time.time())
-        if msg_ts > 1_000_000_000_000:
-            msg_ts //= 1000
+        msg_ts = MainWindow._ts_normalized(
+            msg.get("messageTimestamp", 0) or msg.get("t", 0) or time.time()
+        )
         # System events (group join/leave, settings changes, revokes, ...)
         # must not bump the chat's sort timestamp — see is_countable_message().
         # Without this an old, already-read conversation jumped back to the
         # top of the list purely because a group's metadata changed.
-        if is_countable_message(msg) and msg_ts > int(chat.get("t", 0) or 0):
+        # The existing chat["t"] is normalized to seconds before comparing —
+        # WPPConnect's list-chats can report `t` in milliseconds (~1.7e12), in
+        # which case a live msg_ts in seconds (~1.7e9) would always be "older"
+        # and the chat would never float to the top. _chat_last_ts() normalizes
+        # the same way, so the sort and this bump must agree.
+        _cur_t = MainWindow._ts_normalized(chat.get("t", 0))
+        if is_countable_message(msg) and msg_ts > _cur_t:
             chat["t"] = msg_ts
 
         # ── Avoid duplicate insertions or resolve pending ones ────────────────
@@ -2579,7 +2797,16 @@ class MainWindow(wx.Frame):
 
         # ── Update unread count (only for messages we received) ───────────────
         # System events never count as unread — see is_countable_message().
-        if not from_me and is_countable_message(msg):
+        # History-replay messages (isMdHistoryMsg) never do either: the gateway
+        # re-delivers the whole chat history as live-looking messages.upsert on
+        # every connection (syncFullHistory), and for chats already in the list
+        # those take this live path — counting them would mark every chat
+        # unread on every restart (each one inflated by the previous run). A
+        # genuinely-new message that happens to carry the flag is still shown
+        # and notified; only the unread badge is skipped, matching how
+        # on_historical_message() treats the same records for not-yet-listed
+        # chats.
+        if not from_me and is_countable_message(msg) and not msg.get("isMdHistoryMsg"):
             # Don't increment unread for the conversation already open — it is
             # immediately visible to the user and will be marked as read.
             _cp   = getattr(self, "conversations_panel", None)
@@ -2790,10 +3017,13 @@ class MainWindow(wx.Frame):
         Saves them to local storage, sorts records, and updates the lastMessage/t
         of the chat if the incoming message is newer. Does not trigger notifications or sounds.
         """
-        # See _live_events_ready() — same reasoning as on_new_message().
-        # Nothing is lost by dropping it here: the sync that is either about
-        # to start or already running re-fetches all history regardless.
-        if not self._live_events_ready():
+        # Uses the looser _history_events_ready() gate, not _live_events_ready():
+        # this handler has no unread/sound/notification side effects, so it is
+        # safe as soon as self.chats/self.db exist — even before the sync thread
+        # latches _sync_ever_started. The full-history stream can start the
+        # moment the socket connects, and dropping those early messages lost
+        # history permanently (the sync only re-fetches the newest page).
+        if not self._history_events_ready():
             return
         key        = msg.get("key", {})
         remote_jid = self._normalize_jid(key.get("remoteJid", ""))
@@ -2816,6 +3046,14 @@ class MainWindow(wx.Frame):
         # a display name for group participants we cannot resolve otherwise.
         if self._learn_sender_name(msg):
             self._schedule_save(contacts_dirty=True)
+
+        # ── Canonical reconciliation (same as on_new_message) ─────────────────
+        # A history echo can arrive under the @lid form while the contact is
+        # stored under the phone form (or vice versa). Merging here — instead of
+        # blindly creating a chat under the incoming form — is what keeps the
+        # full-history backfill from spawning a second chat for an already-listed
+        # conversation. See on_new_message() for the same logic.
+        remote_jid = self._reconcile_canonical_jid(remote_jid)
 
         # Retrieve/create local chat object
         chat = self.chats.get(remote_jid)
@@ -3198,6 +3436,28 @@ class MainWindow(wx.Frame):
             # If still missing after download, abort
             if not os.path.isfile(node_exe):
                 logging.error("[ensure_api_modules_installed] Node.js download failed — node.exe still missing")
+                sys.exit(1)
+
+        # FFmpeg is mandatory for voice messaging — auto-download portable version if missing.
+        ffmpeg_exe = resource_path("lib", "ffmpeg.exe") if sys.platform == "win32" else (resource_path("lib", "ffmpeg") if os.path.isfile(resource_path("lib", "ffmpeg")) else (shutil.which("ffmpeg") or "ffmpeg"))
+        if not os.path.isfile(ffmpeg_exe):
+            if self.background_mode:
+                logging.error("[ensure_api_modules_installed] FFmpeg not found and cannot show download dialog in background mode")
+                sys.exit(0)
+            logging.info("[ensure_api_modules_installed] FFmpeg not found — downloading portable version...")
+            from ui.dialogs.ffmpeg_download import FfmpegDownloadDialog
+            def _show_ffmpeg_download():
+                dlg = FfmpegDownloadDialog(self)
+                res = dlg.ShowModal()
+                dlg.Destroy()
+                return res
+            result = self.run_on_main_thread(_show_ffmpeg_download)
+            if result != wx.ID_OK:
+                sys.exit(1)
+            if sys.platform == "win32":
+                ffmpeg_exe = resource_path("lib", "ffmpeg.exe")
+            if not os.path.isfile(ffmpeg_exe):
+                logging.error("[ensure_api_modules_installed] FFmpeg download failed — ffmpeg.exe still missing")
                 sys.exit(1)
 
         _REQUIRED_MARKERS = [
@@ -4612,6 +4872,18 @@ class MainWindow(wx.Frame):
         self.messages_set_completed = False
         self.wait_messages_set()
         self.start_connection_health_checker()
+
+        # Warm up the ffmpeg bootstrap in the background so the first voice
+        # message isn't the first time we discover it's missing (and have to
+        # wait on a download mid-send). No-op in release builds where
+        # lib/ffmpeg.exe ships alongside the app.
+        def _ffmpeg_warmup():
+            try:
+                self._ensure_ffmpeg()
+            except Exception as exc:
+                logging.warning("[audio] ffmpeg warm-up failed: %s", exc)
+        threading.Thread(target=_ffmpeg_warmup, daemon=True).start()
+
         logging.info("[prepare_sync] done")
 
     def start_connection_health_checker(self):
@@ -4662,9 +4934,9 @@ class MainWindow(wx.Frame):
 
     # Consecutive notLogged/QRCODE readings required before believing the device
     # was really unlinked.  The health checker polls every ~30 s.
-    _LOGOUT_CONFIRM_STRIKES = 1
-    _LOGOUT_CONFIRM_SECONDS = 5
-    _LOGOUT_STARTUP_GRACE_SECONDS = 5
+    _LOGOUT_CONFIRM_STRIKES = 3
+    _LOGOUT_CONFIRM_SECONDS = 60
+    _LOGOUT_STARTUP_GRACE_SECONDS = 240
 
     def _still_linked_on_server(self) -> bool:
         """Positive proof the device is still linked, or False if unprovable.
@@ -5815,6 +6087,12 @@ class MainWindow(wx.Frame):
         self.chats = {}
         self.contacts = {}
         self._status_updates = {}
+        if hasattr(self, "_own_sent_ids"):
+            self._own_sent_ids.clear()
+        if hasattr(self, "_exhausted_chats"):
+            self._exhausted_chats.clear()
+        if hasattr(self, "_deleted_chats"):
+            self._deleted_chats.clear()
         if hasattr(self, "_lid_to_phone"):
             self._lid_to_phone.clear()
         else:
@@ -5835,14 +6113,14 @@ class MainWindow(wx.Frame):
             self._resolving_lids.clear()
         else:
             self._resolving_lids = set()
-            
+
         try:
             if hasattr(self, "db") and self.db is not None:
-                self.db.save_full_state({"chats": {}, "contacts": {}})
+                self.db.save_full_state({"chats": {}, "contacts": {}}, clear_first=True)
                 logging.info("[clear_local_data] Database cleared successfully.")
         except Exception as e:
             logging.error(f"[clear_local_data] Failed to clear database: {e}")
-            
+
         # Clear local downloaded media files to prevent cross-account leakage
         for subdir in ("media", "voice_messages"):
             path = data_path(subdir)
@@ -6249,7 +6527,7 @@ class MainWindow(wx.Frame):
                                 _cp = getattr(self, "conversations_panel", None)
                                 if jid == getattr(_cp, "_last_open_jid", ""):
                                     v = 0
-                                elif server_val < local_val:
+                                elif server_val < local_val and not persist_full:
                                     # WPPConnect's list-chats snapshot lagging behind
                                     # live on_new_message increments isn't just a
                                     # startup-sync artifact — this periodic resync
@@ -6259,6 +6537,40 @@ class MainWindow(wx.Frame):
                                     # next live message's toast notification announced
                                     # "1 unread" right after the reset, even though
                                     # several messages had already piled up before it.
+                                    continue
+                                    # During a FULL initial sync (persist_full=True),
+                                    # the server snapshot is authoritative — accept a
+                                    # lower count (falls through to chats[jid][k]=v).
+                                    # This heals unreadCounts that a prior session's
+                                    # history replay inflated in the DB: the server's
+                                    # honest 0 must be able to bring them back down,
+                                    # exactly as WhatsApp Web trusts the server's live
+                                    # count. The 60s poll (persist_full=False) keeps
+                                    # the never-regress guard because there a stale
+                                    # snapshot could wipe a genuinely-live increment.
+                            if k == "t":
+                                # Monotonic guard, same as unreadCount above: a
+                                # server snapshot taken before the newest live
+                                # message must not regress the locally-bumped
+                                # sort timestamp (in seconds). Otherwise a chat
+                                # that just floated to the top on a new message
+                                # sinks back on the next 60s poll. Values are
+                                # normalized (ms→s) so both sides compare in the
+                                # same unit, exactly like _chat_last_ts() does.
+                                if MainWindow._ts_normalized(v) < MainWindow._ts_normalized(chats[jid].get("t")):
+                                    continue
+                            if k == "lastMessage":
+                                # Keep the newer preview: a stale server
+                                # lastMessage must not overwrite a newer one the
+                                # live path already stored.
+                                def _lm_ts(m):
+                                    if not isinstance(m, dict):
+                                        return 0
+                                    val = int(m.get("messageTimestamp") or m.get("timestamp") or m.get("t") or 0)
+                                    if val > 1_000_000_000_000:
+                                        val //= 1000
+                                    return val
+                                if _lm_ts(v) < _lm_ts(chats[jid].get("lastMessage")):
                                     continue
                             chats[jid][k] = v
                         # The incoming chat dict may carry the group's real
@@ -6323,8 +6635,15 @@ class MainWindow(wx.Frame):
 
                     # Check if the JID starts with "0@" (official WhatsApp/system account)
                     is_system = jid.startswith("0@")
-                    
+
                     # Parse and clean pin values to prevent bool() truthiness bug on non-standard fields
+                    # `pin_present` records whether the server explicitly carried
+                    # a `pin` field at all. A locally-pinned chat whose server
+                    # payload omits `pin` (Baileys serialises chats without a
+                    # pin field until it has one) must NOT be silently unpinned
+                    # by this poll — that would undo a pin the user set seconds
+                    # ago. Only an explicit server value can change pin state.
+                    pin_present = "pin" in chat
                     pin_val = chat.get("pin")
                     if isinstance(pin_val, str):
                         if pin_val.lower() == "true":
@@ -6342,41 +6661,47 @@ class MainWindow(wx.Frame):
                         if isinstance(pin_val, bool):
                             is_pinned = pin_val
                         elif isinstance(pin_val, (int, float)):
-                            is_pinned = pin_val > 1000000
-                        
+                            is_pinned = pin_val > 0
+                        elif not pin_present:
+                            # No pin field in the payload — not a pin change.
+                            is_pinned = None
 
+                    # Pin membership is tracked under the canonical JID form —
+                    # see _canonical_jid — so the poll's reconcile agrees with
+                    # the sort key and the live on_chat_pin_update() path.
+                    canonical_pin_jid = self._canonical_jid(jid)
 
                     if is_pinned:
-                        if jid not in self._pinned_chats:
-                            self._pinned_chats.add(jid)
+                        if canonical_pin_jid not in self._pinned_chats:
+                            self._pinned_chats.add(canonical_pin_jid)
                             db_changed = True
                         # Also pin the alternate JID if present
-                        if jid.endswith("@lid"):
-                            alt = getattr(self, "_lid_to_phone", {}).get(jid, "")
+                        if canonical_pin_jid.endswith("@lid"):
+                            alt = getattr(self, "_lid_to_phone", {}).get(canonical_pin_jid, "")
                             if alt:
                                 alt_norm = self._normalize_jid(alt)
                                 if alt_norm not in self._pinned_chats:
                                     self._pinned_chats.add(alt_norm)
                                     db_changed = True
                         else:
-                            alt = getattr(self, "_phone_to_lid", {}).get(jid, "")
+                            alt = getattr(self, "_phone_to_lid", {}).get(canonical_pin_jid, "")
                             if alt:
                                 if alt not in self._pinned_chats:
                                     self._pinned_chats.add(alt)
                                     db_changed = True
-                    elif jid in self._pinned_chats:
-                        self._pinned_chats.remove(jid)
+                    elif is_pinned is False and canonical_pin_jid in self._pinned_chats:
+                        self._pinned_chats.remove(canonical_pin_jid)
                         db_changed = True
                         # Also remove pin from the alternate JID if present
-                        if jid.endswith("@lid"):
-                            alt = getattr(self, "_lid_to_phone", {}).get(jid, "")
+                        if canonical_pin_jid.endswith("@lid"):
+                            alt = getattr(self, "_lid_to_phone", {}).get(canonical_pin_jid, "")
                             if alt:
                                 alt_norm = self._normalize_jid(alt)
                                 if alt_norm in self._pinned_chats:
                                     self._pinned_chats.remove(alt_norm)
                                     db_changed = True
                         else:
-                            alt = getattr(self, "_phone_to_lid", {}).get(jid, "")
+                            alt = getattr(self, "_phone_to_lid", {}).get(canonical_pin_jid, "")
                             if alt:
                                 if alt in self._pinned_chats:
                                     self._pinned_chats.remove(alt)
@@ -6402,7 +6727,7 @@ class MainWindow(wx.Frame):
                     for stale_jid in list(chats.keys()):
                         if stale_jid.endswith("@g.us"):
                             continue
-                        if stale_jid not in response_jids:
+                        if stale_jid in response_jids:
                             continue
                         if stale_jid in self._pinned_chats or stale_jid in self._muted_chats:
                             continue
@@ -6790,6 +7115,11 @@ class MainWindow(wx.Frame):
 
         Called lazily when a group has no cached name. Returns the group
         name or empty string on failure.
+
+        The resolved name is also written to the chat dict's ``name`` key and
+        persisted, not just held in the in-memory ``_group_name_cache`` — the
+        cache is recreated empty every launch, so a name that only ever lived
+        there was lost on restart until /group-info was re-fetched.
         """
         try:
             url = f"{self.wpp_server}:{self.wpp_port}/api/{self.token}/group-info/{jid}"
@@ -6803,6 +7133,12 @@ class MainWindow(wx.Frame):
                     if not hasattr(self, "_group_name_cache"):
                         self._group_name_cache = {}
                     self._group_name_cache[jid] = name
+                    # Persist into the chat record so the name survives a
+                    # restart via the DB name column, not just this session.
+                    chat = getattr(self, "chats", {}).get(jid)
+                    if chat is not None and not (chat.get("name") or "").strip():
+                        chat["name"] = name
+                        self._schedule_save(dirty_jid=jid)
                     return name
         except Exception:
             pass
@@ -7349,25 +7685,46 @@ class MainWindow(wx.Frame):
         pinned   = self._pinned_chats
         my_jid   = getattr(self, "my_jid", "")
 
-        # Dedup: if both a @lid JID and its corresponding phone JID exist as
-        # separate keys in self.chats, only render the one with more content
-        # (prefer @lid since that's the active WPPConnect chat). Build a set of
-        # phone JIDs that are already covered by a @lid entry so we can skip them.
-        lid_to_phone = getattr(self, "_lid_to_phone", {})
-        phone_to_lid = getattr(self, "_phone_to_lid", {})
-        _covered_by_lid: set[str] = set()
-        for lid_jid, phone_jid in lid_to_phone.items():
-            if lid_jid in self.chats and phone_jid in self.chats:
-                # Both exist — keep the one with more messages (usually lid).
-                lid_msgs = len(self.chats[lid_jid].get("messages", {}).get("messages", {}).get("records", []))
-                phone_msgs = len(self.chats[phone_jid].get("messages", {}).get("messages", {}).get("records", []))
-                if lid_msgs >= phone_msgs:
-                    _covered_by_lid.add(phone_jid)
-                else:
-                    _covered_by_lid.add(lid_jid)
+        # Dedup backstop: if both a @lid JID and its corresponding phone JID
+        # still exist as separate keys in self.chats (a mapping learned after a
+        # merge, or a leftover the in-session merge hasn't reached yet), only
+        # render ONE of them — the one with the newest activity, so a fresh
+        # live message on either form always wins. This used to keep the copy
+        # with MORE stored records, which hid the entry that had just received
+        # the live message (a stale @lid with long history hid the fresh phone
+        # entry → the chat never floated). Now it keeps the newest, and on a
+        # tie prefers the canonical phone form. The real dedup happens at merge
+        # time in _merge_lid_into_phone()/on_new_message(); this is only the
+        # render-time safety net.
+        def _activity_ts(chat):
+            ts = int(chat.get("t", 0) or 0)
+            if ts > 1_000_000_000_000:
+                ts //= 1000
+            lm = chat.get("lastMessage")
+            if isinstance(lm, dict):
+                lm_ts = int(lm.get("messageTimestamp") or lm.get("timestamp") or lm.get("t") or 0)
+                if lm_ts > 1_000_000_000_000:
+                    lm_ts //= 1000
+                if lm_ts > ts:
+                    ts = lm_ts
+            return ts
 
-        main_chats, main_names = [], []
-        arch_chats, arch_names = [], []
+        _covered_by_lid: set[str] = set()
+        for lid_jid, phone_jid in list(getattr(self, "_lid_to_phone", {}).items()):
+            lid_chat = self.chats.get(lid_jid)
+            phone_chat = self.chats.get(phone_jid)
+            if lid_chat is None or phone_chat is None:
+                continue
+            lid_ts = _activity_ts(lid_chat)
+            phone_ts = _activity_ts(phone_chat)
+            if phone_ts >= lid_ts:
+                # Phone (canonical) form wins — hide the @lid copy.
+                _covered_by_lid.add(lid_jid)
+            else:
+                _covered_by_lid.add(phone_jid)
+
+        main_chats, main_names, main_render_jids = [], [], []
+        arch_chats, arch_names, arch_render_jids = [], [], []
 
         # Every row the UI renders is identified by ``chat["remoteJid"]``, not by
         # the ``self.chats`` key it was stored under — and the two are NOT always
@@ -7401,7 +7758,11 @@ class MainWindow(wx.Frame):
                     records = inner_wrapper.get("records") or []
             last_msg  = chat.get("lastMessage")
             unread    = int(chat.get("unreadCount", 0) or 0)
-            is_pinned = jid in pinned
+            # Pin/archive/mute membership is tracked under the canonical JID
+            # form (see _canonical_jid), not the raw dict key — a chat stored
+            # under @lid while its pin is recorded under the phone form must
+            # still be recognized (and floated / kept visible) here.
+            is_pinned = self._canonical_jid(jid) in pinned or jid in pinned
             # Skip chats with absolutely no content AND no identity.
             # We do NOT skip based on missing messages alone: during and just
             # after sync many valid chats have empty records but still carry a
@@ -7409,9 +7770,25 @@ class MainWindow(wx.Frame):
             # A cleared conversation is *supposed* to be empty: it must stay in
             # the list (with no preview) instead of vanishing as if deleted.
             is_cleared   = jid in self.settings.get("cleared_chats", {})
-            has_content  = bool(records or last_msg or unread > 0 or is_pinned or is_cleared)
-
+            
+            def _is_real_msg(m):
+                if not isinstance(m, dict):
+                    return False
+                if m.get("broadcast") or m.get("isBroadcast"):
+                    return False
+                key = m.get("key", {})
+                if isinstance(key, dict) and str(key.get("remoteJid", "")).endswith("@broadcast"):
+                    return False
+                return is_countable_message(m) or bool(m.get("conversation") or m.get("body") or m.get("message"))
+            
             is_group = jid.endswith("@g.us")
+            if not is_group:
+                has_real_records = any(_is_real_msg(r) for r in (records if isinstance(records, list) else []))
+                has_real_last = _is_real_msg(last_msg)
+                has_content = bool(has_real_records or has_real_last or unread > 0 or is_pinned or is_cleared)
+            else:
+                has_content = bool(records or last_msg or unread > 0 or is_pinned or is_cleared)
+
             resolved_name = ""
             msg_push = ""
             # Resolve the contact name BEFORE deciding whether to drop the chat.
@@ -7429,7 +7806,15 @@ class MainWindow(wx.Frame):
             name_hint    = (chat.get("name") or chat.get("pushName") or resolved_name or
                             self._group_name_from_chat_dict(chat)).strip()
             has_identity = bool(name_hint and not name_hint.isdigit() and len(name_hint) > 1)
-            if not has_content and not has_identity:
+            is_self_chat = self._is_self_jid(jid)
+            if is_self_chat:
+                has_real_records = any(_is_real_msg(r) for r in records)
+                has_real_last = _is_real_msg(last_msg)
+                if not (has_real_records or has_real_last or unread > 0 or is_pinned or is_cleared):
+                    continue
+            if not is_group and not has_content:
+                continue
+            if is_group and not has_content and not has_identity:
                 continue
 
             def get_valid_name(val):
@@ -7492,8 +7877,7 @@ class MainWindow(wx.Frame):
                                 elif phone_jid and not phone_jid.endswith("@lid"):
                                     name = format_number(phone_jid)
                                 else:
-                                    numeric = jid.split("@")[0].split(":")[0]
-                                    name = format_number(numeric) if numeric.isdigit() else self.i18n.t("unknown_contact")
+                                    name = self.i18n.t("unknown_contact")
                             else:
                                 numeric = jid.split("@")[0].split(":")[0]
                                 if numeric.isdigit():
@@ -7524,9 +7908,11 @@ class MainWindow(wx.Frame):
             if is_archived:
                 arch_chats.append(chat)
                 arch_names.append(name)
+                arch_render_jids.append(render_jid)
             else:
                 main_chats.append(chat)
                 main_names.append(name)
+                main_render_jids.append(render_jid)
 
         # Pinned chats float to the top; within each group sort by most-recent
         # message timestamp descending (newest first), then alphabetically.
@@ -7539,17 +7925,16 @@ class MainWindow(wx.Frame):
         # (see on_new_message()/on_historical_message()), but this also
         # scans every raw record directly, so it needs the same filter.
         def _chat_last_ts(c):
-            # Fallback to chat's own last activity timestamp (t)
-            chat_ts = int(c.get("t", 0) or 0)
-            if chat_ts > 1_000_000_000_000:
-                chat_ts //= 1000
-            ts = chat_ts
+            # Fallback to chat's own last activity timestamp (t), normalized to
+            # seconds — see _ts_normalized (a server `t` in ms must not dwarf a
+            # live message timestamp in seconds).
+            ts = MainWindow._ts_normalized(c.get("t", 0))
 
             lm = c.get("lastMessage")
             if isinstance(lm, dict) and is_countable_message(lm):
-                lm_ts = int(lm.get("timestamp", 0) or lm.get("messageTimestamp", 0) or lm.get("t", 0) or 0)
-                if lm_ts > 1_000_000_000_000:
-                    lm_ts //= 1000
+                lm_ts = MainWindow._ts_normalized(
+                    lm.get("timestamp", 0) or lm.get("messageTimestamp", 0) or lm.get("t", 0)
+                )
                 if lm_ts > ts:
                     ts = lm_ts
 
@@ -7577,19 +7962,18 @@ class MainWindow(wx.Frame):
 
             return ts if ts else 1
 
-        def _sort_key(pair):
-            c, n = pair
-            j   = c.get("remoteJid", "")
-            pin = 0 if j in pinned else 1
+        def _sort_key(tuple_item):
+            c, n, rjid = tuple_item
+            pin = 0 if (self._canonical_jid(rjid) in pinned or rjid in pinned) else 1
             return (pin, -_chat_last_ts(c), n.lower())
 
-        pairs = sorted(zip(main_chats, main_names), key=_sort_key)
-        main_chats = [c for c, _ in pairs]
-        main_names = [n for _, n in pairs]
+        tuples = sorted(zip(main_chats, main_names, main_render_jids), key=_sort_key)
+        main_chats = [c for c, _, _ in tuples]
+        main_names = [n for _, n, _ in tuples]
 
-        arch_pairs = sorted(zip(arch_chats, arch_names), key=_sort_key)
-        arch_chats = [c for c, _ in arch_pairs]
-        arch_names = [n for _, n in arch_pairs]
+        arch_tuples = sorted(zip(arch_chats, arch_names, arch_render_jids), key=_sort_key)
+        arch_chats = [c for c, _, _ in arch_tuples]
+        arch_names = [n for _, n, _ in arch_tuples]
 
         return main_chats, main_names, arch_chats, arch_names
 
@@ -9601,10 +9985,10 @@ class MainWindow(wx.Frame):
                 if isinstance(resp, list) and len(resp) > 0:
                     resp = resp[0]
                 if isinstance(resp, dict):
-                    msg_id = resp.get("id")
+                    msg_id = resp.get("key", {}).get("id") if isinstance(resp.get("key"), dict) else resp.get("id")
                     if isinstance(msg_id, dict):
                         msg_id = msg_id.get("_serialized", "")
-                    parts = msg_id.split("_") if msg_id else []
+                    parts = msg_id.split("_") if isinstance(msg_id, str) and msg_id else []
                     clean_id = parts[2] if len(parts) > 2 else (parts[-1] if parts else msg_id)
                     return clean_id or True
                 return True
@@ -9656,15 +10040,80 @@ class MainWindow(wx.Frame):
             return system_ffmpeg
         return None
 
+    def _ensure_ffmpeg(self) -> str:
+        """Ensure a usable ffmpeg.exe is available for voice send/playback.
+
+        ffmpeg is required at two points: WAV→OGG encoding before sending
+        (_convert_wav_to_ogg) and OGG→WAV decoding before BASS playback
+        (conversations._play_audio). It is NOT bundled in the repo, not a
+        dependency of client/api, and not assumed on PATH — so on a fresh
+        dev machine both voice paths silently degraded (raw WAV sent labelled
+        "audio/ogg" → recipient can't play, or playback failed).
+
+        If _find_api_ffmpeg() already finds one (bundled in lib/, shipped in a
+        release build, or on PATH) this is a no-op. Otherwise it downloads the
+        same portable ffmpeg.exe the release build script (build.py) bundles
+        into lib/, into the same location — so dev mode ends up identical to a
+        release bundle. Runs at most once per process (guarded by
+        _ffmpeg_bootstrap_fired); a download failure degrades to the existing
+        behaviour (log + caller falls back) instead of raising, so startup
+        never blocks on the network.
+        """
+        existing = self._find_api_ffmpeg()
+        if existing:
+            return existing
+        if getattr(self, "_ffmpeg_bootstrap_fired", False):
+            return None
+        self._ffmpeg_bootstrap_fired = True
+
+        target_dir = resource_path("lib")
+        try:
+            return self._download_ffmpeg(target_dir)
+        except Exception as exc:
+            logging.error("[audio] ffmpeg bootstrap download failed: %s", exc)
+        return None
+
+    def _download_ffmpeg(self, target_dir: str) -> str:
+        """Download the portable ffmpeg.exe into *target_dir* and return its
+        path (or '' on failure). Split out of _ensure_ffmpeg so tests can stub
+        the network call; this is the same binary build.py bundles."""
+        import urllib.request
+        import zipfile
+        import tempfile
+        if not os.path.isdir(target_dir):
+            os.makedirs(target_dir, exist_ok=True)
+        dl_url = (
+            "https://github.com/ffbinaries/ffbinaries-prebuilt/releases/download/"
+            "v4.4.1/ffmpeg-4.4.1-win-64.zip"
+        )
+        temp_zip = os.path.join(tempfile.gettempdir(), "winzapp_ffmpeg_bootstrap.zip")
+        logging.info("[audio] ffmpeg not found — downloading portable build to %s", target_dir)
+        urllib.request.urlretrieve(dl_url, temp_zip)
+        with zipfile.ZipFile(temp_zip, "r") as zf:
+            zf.extract("ffmpeg.exe", target_dir)
+        ffmpeg_dst = os.path.join(target_dir, "ffmpeg.exe")
+        if os.path.isfile(ffmpeg_dst) and os.path.getsize(ffmpeg_dst) > 0:
+            logging.info("[audio] ffmpeg bootstrap complete: %s", ffmpeg_dst)
+            return ffmpeg_dst
+        logging.error("[audio] ffmpeg download produced no usable binary at %s", ffmpeg_dst)
+        return ""
+
     def _convert_wav_to_ogg(self, wav_path: str) -> str | None:
         """
         Convert a WAV file to OGG/Opus using the bundled ffmpeg binary.
         Returns the path to the new .ogg file, or None on failure.
         """
-        ffmpeg = self._find_api_ffmpeg()
+        # Attempt the once-per-launch bootstrap (download portable ffmpeg into
+        # lib/) before giving up — this is what makes voice messages work on a
+        # fresh dev machine. In the frozen release the binary ships in lib/ so
+        # this is a fast no-op.
+        ffmpeg = self._find_api_ffmpeg() or self._ensure_ffmpeg()
         if not ffmpeg or not os.path.isfile(ffmpeg):
-            logging.warning("[audio] ffmpeg not found — sending WAV (may fail). Searched: %s",
-                            resource_path("api", "node_modules", "@ffmpeg-installer", "ffmpeg", "bin"))
+            logging.warning(
+                "[audio] ffmpeg not found and bootstrap unavailable — "
+                "voice send requires ffmpeg (WAV→OGG). Searched lib/ and %s.",
+                resource_path("api", "node_modules", "@ffmpeg-installer", "ffmpeg", "bin"),
+            )
             return None
         ogg_path = wav_path + ".ogg"
         try:
@@ -9676,8 +10125,8 @@ class MainWindow(wx.Frame):
                 [ffmpeg, "-y", "-i", wav_path,
                  "-vn",
                  "-ac", "1",
-                 "-ar", "16000",
-                 "-c:a", "libopus", "-b:a", "16k",
+                 "-ar", "48000",
+                 "-c:a", "libopus", "-b:a", "32k",
                  "-vbr", "on", "-compression_level", "10",
                  "-application", "voip",
                  ogg_path],
@@ -9686,8 +10135,25 @@ class MainWindow(wx.Frame):
                 creationflags=creationflags,
             )
             if result.returncode == 0 and os.path.isfile(ogg_path) and os.path.getsize(ogg_path) > 0:
-                logging.debug("[audio] WAV→OGG conversion succeeded: %s", ogg_path)
+                logging.debug("[audio] WAV→OGG conversion succeeded (libopus): %s", ogg_path)
                 return ogg_path
+
+            # Fallback: Retry with native opus encoder (-c:a opus) if libopus fails
+            result_fb = subprocess.run(
+                [ffmpeg, "-y", "-i", wav_path,
+                 "-vn",
+                 "-ac", "1",
+                 "-ar", "48000",
+                 "-c:a", "opus", "-b:a", "32k",
+                 ogg_path],
+                capture_output=True,
+                timeout=60,
+                creationflags=creationflags,
+            )
+            if result_fb.returncode == 0 and os.path.isfile(ogg_path) and os.path.getsize(ogg_path) > 0:
+                logging.debug("[audio] WAV→OGG conversion succeeded (opus fallback): %s", ogg_path)
+                return ogg_path
+
             logging.error("[audio] ffmpeg WAV→OGG failed (rc=%s): %s",
                           result.returncode,
                           (result.stderr or b"").decode("utf-8", errors="replace")[-800:])
@@ -9696,7 +10162,7 @@ class MainWindow(wx.Frame):
         return None
 
     def send_audio_message(self, remote_jid: str, wav_path: str, quoted=None,
-                           ogg_bytes: bytes = None) -> bool:
+                           ogg_bytes: bytes = None, duration: int = 0) -> bool:
         """
         Encode a recorded WAV file to OGG Opus via FFmpeg (or pre-encoded ogg_bytes)
         and send it as a PTT voice message using /send-voice-base64.
@@ -9714,7 +10180,7 @@ class MainWindow(wx.Frame):
         logging.info("[VOICE_TIMING] send_audio_message started for %s (isLid=%s, ogg_bytes=%s) — jid resolved in %.3fs",
                      remote_jid, is_lid_target, "yes" if ogg_bytes else "NO", _time.perf_counter() - _tsend0)
 
-        if ogg_bytes is None:
+        if not ogg_bytes:
             # Fallback path: convert WAV to OGG using ffmpeg and read the bytes
             _t_fallback = _time.perf_counter()
             logging.info("[VOICE_TIMING] ogg_bytes is None — running ffmpeg AGAIN as fallback (this should NOT happen!)")
@@ -9731,15 +10197,33 @@ class MainWindow(wx.Frame):
                     except Exception:
                         pass
 
-            if ogg_bytes is None:
-                # If conversion failed, try reading WAV directly as a fallback (may fail at API level)
-                logging.warning("[send_audio_message] FFmpeg conversion failed or OGG empty, trying raw WAV fallback")
+            if not ogg_bytes:
+                # FFmpeg is the only way to get OGG/Opus, and it is not reliably
+                # present (bundled only in release builds; the one-shot bootstrap
+                # can fail on a fresh dev machine). Falling back to the recorded
+                # WAV is safe here because the GATEWAY — not this function —
+                # picks the mimetype from the actual bytes: sendVoiceBase64
+                # detects the RIFF header and labels it audio/wav, so the
+                # recipient gets a playable audio message. This is explicitly
+                # NOT the old bug (raw WAV bytes declared as audio/ogg, which
+                # WhatsApp couldn't play) — there the declared mimetype didn't
+                # match the bytes; here it does.
+                logging.warning("[send_audio_message] FFmpeg unavailable — falling back to sending the recorded WAV directly (gateway labels it audio/wav PTT)")
                 try:
                     with open(wav_path, "rb") as fh:
                         ogg_bytes = fh.read()
                 except Exception as exc:
-                    logging.error("[send_audio_message] cannot read WAV %s: %s", wav_path, exc)
-                    return {"ok": False, "error": str(exc)[:200], "retry": False}
+                    logging.error("[send_audio_message] cannot read WAV %s for fallback send: %s", wav_path, exc)
+                    return {"ok": False,
+                            "error": "voice_read_wav_failed",
+                            "retry": False}
+
+            if not (ogg_bytes.startswith(b"OggS") or ogg_bytes.startswith(b"RIFF")):
+                logging.warning("[send_audio_message] encoded bytes are not OGG/WAV (magic %r) — refusing to send",
+                                ogg_bytes[:8])
+                return {"ok": False,
+                        "error": "voice_encode_failed_not_ogg",
+                        "retry": False}
             logging.info("[VOICE_TIMING] fallback encode+read done in %.3fs",
                          _time.perf_counter() - _t_fallback)
 
@@ -9747,14 +10231,13 @@ class MainWindow(wx.Frame):
 
         url = f"{self.wpp_server}:{self.wpp_port}/api/{self.token}/send-voice-base64"
         phone_net = remote_jid
-        if phone_net.endswith("@s.whatsapp.net"):
-            phone_net = phone_net.replace("@s.whatsapp.net", "@c.us")
         quoted_id = self._serialize_quoted_id(quoted, fallback_jid=phone_net) if quoted else None
         payload = {
-            "phone": [phone_net],
-            "base64Ptt": f"data:audio/ogg;codecs=opus;base64,{audio_b64}",
+            "phone": phone_net,
+            "base64Ptt": audio_b64,
             "isGroup": phone_net.endswith("@g.us"),
             "isLid": is_lid_target,
+            "duration": duration,
         }
         if quoted_id:
             payload["quotedMessageId"] = quoted_id
@@ -9811,10 +10294,10 @@ class MainWindow(wx.Frame):
                 if isinstance(resp, list) and len(resp) > 0:
                     resp = resp[0]
                 if isinstance(resp, dict):
-                    msg_id = resp.get("id")
+                    msg_id = resp.get("key", {}).get("id") if isinstance(resp.get("key"), dict) else resp.get("id")
                     if isinstance(msg_id, dict):
                         msg_id = msg_id.get("_serialized", "")
-                    parts = msg_id.split("_") if msg_id else []
+                    parts = msg_id.split("_") if isinstance(msg_id, str) and msg_id else []
                     clean_id = parts[2] if len(parts) > 2 else (parts[-1] if parts else msg_id)
                     return clean_id or True
                 return True
@@ -10164,6 +10647,9 @@ class MainWindow(wx.Frame):
 
     def _resolve_jid_name(self, jid_norm: str) -> str:
         """Return the best display name for a participant JID (contact lookup + fallback)."""
+        my_jid = getattr(self, "my_jid", "")
+        if my_jid and self._canonical_jid(jid_norm) == self._canonical_jid(my_jid):
+            return self.i18n.t("self_chat_name") if hasattr(self, "i18n") else "Você"
         ppm = getattr(self, "_presence_pushname_map", {})
 
         # Build candidate list covering all three JID formats for the same person.
@@ -10531,7 +11017,10 @@ class MainWindow(wx.Frame):
         # existed on MainWindow and so always fell back to "", silently
         # disabling this guard entirely.
         cp = getattr(self, "conversations_panel", None)
-        if normalized == getattr(cp, "_last_open_jid", ""):
+        open_jid = ""
+        if cp and getattr(cp, "conversation", None):
+            open_jid = cp.conversation.get("remoteJid", "")
+        if open_jid and normalized == self._normalize_jid(open_jid):
             unread_count = 0
         chat["unreadCount"] = unread_count
         self._schedule_save(dirty_jid=normalized)
@@ -10557,24 +11046,32 @@ class MainWindow(wx.Frame):
                 alt = getattr(self, "_phone_to_lid", {}).get(normalized, "")
                 if alt: chat = self.chats.get(alt)
 
+        # Pin state is tracked under the canonical JID form (see
+        # _canonical_jid), so a pin survives a @lid↔phone merge regardless of
+        # which form this event carried. Add/remove the canonical key (and any
+        # known alternate) so the _compute_chat_lists sort key — which also
+        # compares canonical forms — always agrees with _pinned_chats.
+        canonical = self._canonical_jid(normalized)
         if is_pinned:
-            self._pinned_chats.add(normalized)
-            if normalized.endswith("@lid"):
-                alt_phone = getattr(self, "_lid_to_phone", {}).get(normalized, "")
+            self._pinned_chats.add(canonical)
+            # Mirror to the alternate form when the mapping is known, so a
+            # later merge never strands the pin under the merged-away key.
+            if canonical.endswith("@lid"):
+                alt_phone = getattr(self, "_lid_to_phone", {}).get(canonical, "")
                 if alt_phone:
                     self._pinned_chats.add(self._normalize_jid(alt_phone))
             else:
-                alt_lid = getattr(self, "_phone_to_lid", {}).get(normalized, "")
+                alt_lid = getattr(self, "_phone_to_lid", {}).get(canonical, "")
                 if alt_lid:
                     self._pinned_chats.add(alt_lid)
         else:
-            self._pinned_chats.discard(normalized)
-            if normalized.endswith("@lid"):
-                alt_phone = getattr(self, "_lid_to_phone", {}).get(normalized, "")
+            self._pinned_chats.discard(canonical)
+            if canonical.endswith("@lid"):
+                alt_phone = getattr(self, "_lid_to_phone", {}).get(canonical, "")
                 if alt_phone:
                     self._pinned_chats.discard(self._normalize_jid(alt_phone))
             else:
-                alt_lid = getattr(self, "_phone_to_lid", {}).get(normalized, "")
+                alt_lid = getattr(self, "_phone_to_lid", {}).get(canonical, "")
                 if alt_lid:
                     self._pinned_chats.discard(alt_lid)
 
@@ -10962,8 +11459,7 @@ class MainWindow(wx.Frame):
             if alt_lid:
                 target_phone = alt_lid
 
-        if target_phone.endswith("@s.whatsapp.net"):
-            target_phone = target_phone.rsplit("@", 1)[0] + "@c.us"
+
         
         is_lid_target = target_phone.endswith("@lid")
 
@@ -11169,7 +11665,25 @@ class MainWindow(wx.Frame):
                     logging.warning("[LID Mapping] Failed to save mapping incrementally: %s", exc)
                     # Fallback to save_data if incremental save fails
                     self.save_data(self.chats, self.contacts)
-            wx.CallAfter(self._schedule_set_chats)
+
+            # A mapping learned mid-session may mean the same conversation now
+            # exists under both the @lid key and the phone key. Collapse them on
+            # the wx main thread (this method can run on socket/worker threads,
+            # where mutating self.chats/conversations_panel is unsafe). This is
+            # what stops a duplicate chat created before the mapping existed from
+            # lingering after the mapping arrives.
+            if getattr(self, "_ui_ready_event", None) and self._ui_ready_event.is_set():
+                def _merge_lid_now():
+                    try:
+                        if lid_jid in self.chats:
+                            self._merge_lid_into_phone(lid_jid, phone_jid)
+                            self._schedule_set_chats()
+                    except Exception as exc:
+                        logging.warning("[LID Mapping] Post-registration merge failed %s->%s: %s",
+                                        lid_jid, phone_jid, exc)
+                wx.CallAfter(_merge_lid_now)
+            else:
+                wx.CallAfter(self._schedule_set_chats)
 
     def resolve_lid_jids_via_api(self, jids):
         """Resolve a list of @lid JIDs to phone JIDs using WPPConnect contact endpoint."""
@@ -12151,7 +12665,12 @@ class MainWindow(wx.Frame):
     # ── Pin ───────────────────────────────────────────────────────────────────
 
     def is_chat_pinned(self, jid: str) -> bool:
-        return jid in self._pinned_chats
+        # Pin state is tracked under the canonical JID form (so the pin
+        # survives a @lid↔phone toggle); a caller asking about either form
+        # must get the same answer. This is what makes the `(pinned)` suffix in
+        # add_chats_to_ui()/_refresh_archived_chats_in_ui() match the float-to-top
+        # rule in _compute_chat_lists().
+        return self._canonical_jid(jid) in self._pinned_chats
 
     def _apply_pin_state(self, jid: str, pinned: bool):
         """Local-only half of pin/unpin: mutate _pinned_chats (+ its alt-JID
@@ -12159,19 +12678,22 @@ class MainWindow(wx.Frame):
         from pin_chat()/unpin_chat() so _sync_pin_to_server() can call this
         again to roll back the optimistic change if WhatsApp rejects it,
         without recursing back into a server call."""
-        normalized = self._normalize_jid(jid)
+        # Store under the canonical form so a @lid↔phone merge (which keeps
+        # the phone key) never strands the pin under a key that later gets
+        # removed — see _canonical_jid. Mirror to the alternate form when known.
+        canonical = self._canonical_jid(jid)
         if pinned:
-            self._pinned_chats.add(normalized)
+            self._pinned_chats.add(canonical)
         else:
-            self._pinned_chats.discard(normalized)
+            self._pinned_chats.discard(canonical)
         # Also mirror onto the alternate JID form if present
-        if normalized.endswith("@lid"):
-            alt = getattr(self, "_lid_to_phone", {}).get(normalized, "")
+        if canonical.endswith("@lid"):
+            alt = getattr(self, "_lid_to_phone", {}).get(canonical, "")
             if alt:
                 alt = self._normalize_jid(alt)
                 self._pinned_chats.add(alt) if pinned else self._pinned_chats.discard(alt)
         else:
-            alt = getattr(self, "_phone_to_lid", {}).get(normalized, "")
+            alt = getattr(self, "_phone_to_lid", {}).get(canonical, "")
             if alt:
                 self._pinned_chats.add(alt) if pinned else self._pinned_chats.discard(alt)
 
@@ -12688,7 +13210,11 @@ class MainWindow(wx.Frame):
                 phone_jid = getattr(self, "_lid_to_phone", {}).get(jid, "")
             return format_number(phone_jid) if phone_jid else self.i18n.t("unnamed_participant")
         if jid.endswith("@g.us"):
-            return self.i18n.t("unknown_group")
+            contact = self._get_contact_tolerant(jid)
+            name = (contact.get("name") or contact.get("subject") or "") if contact else ""
+            if not name:
+                name = getattr(self, "_group_name_cache", {}).get(jid, "")
+            return name
         return format_number(jid)
 
     # Message types that count as "the conversation's last message" — the ones

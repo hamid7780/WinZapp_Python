@@ -1,85 +1,80 @@
-# WinZapp — Baileys Gateway Migration Progress & Architecture Guide
+# WinZapp — Progress Map
 
-## 1. Project Goal & Overview
-WinZapp has been migrated from legacy **WPPConnect** (heavy Puppeteer / Headless Chrome backend, ~1,000 MB RAM, 30s boot time) to a lightweight **Baileys Gateway Server** (`@whiskeysockets/baileys` direct WebSocket engine, ~50–60 MB RAM, ~1s startup).
+## What this is
 
-**Strategy A Enforcement**: The Python desktop client UI, accessibility engine (`nvda`/`sapi`), encrypted SQLite database (`messages.db`), and user interfaces (`client/main.py`, `client/ui/conversations.py`, `client/ui/dialogs/connect.py`) remain preserved while communicating seamlessly with the new Node.js Gateway Server on port `6300`.
+WinZapp is a free, self-hosted Windows desktop WhatsApp client for **accessibility** (blind/low-vision users via NVDA/JAWS/Narrator through `accessible_output2`). It is a hybrid app: a Python 3.14 + wxPython GUI process (`client/`) drives a locally-run **Baileys Gateway Server** (`client/api/`, Node.js) that acts as the WhatsApp Web gateway. The two talk over local HTTP REST (`http://127.0.0.1:6300/api/...`) and Socket.IO.
 
----
+> **WPPConnect is gone.** The legacy `@wppconnect-team` translation layer was completely removed. The gateway and Python UI now communicate strictly using native Baileys data structures.
 
-## 2. Completed Milestones & Accomplishments
+## Current status (2026-08-04)
 
-### A. Node.js Baileys Gateway Server (`client/api_patches/src/`)
+**753 passing / 0 failing** pytest tests across the entire test suite!
+
+- `python setup_api.py` compiles clean with 0 TypeScript errors.
+- `python -m pytest` passes **753/753 tests**.
+
+## Comprehensive Refactoring & Native Baileys Migration
+
+### Phase A — Gateway Server & Native Data Shapes
 1. **Baileys WebSocket Manager (`baileysManager.ts`)**:
    - Integrated `@whiskeysockets/baileys` with `useMultiFileAuthState`.
-   - Enabled full history synchronization (`syncFullHistory: true`) to ensure all messages are fetched during initialization.
-   - Added `getSafeSessionName()` to sanitize session strings and strip colons (`:`), preventing Windows NTFS folder creation failures (`ENOENT`).
-   - Implemented direct 8-digit Phone Pairing Code generation via `sock.requestPairingCode(phone)`.
-   - Added Node.js v18 Web Crypto polyfill (`globalThis.crypto = crypto.webcrypto || crypto`) at the very top of `server.ts` and `baileysManager.ts`, resolving `ReferenceError: crypto is not defined`.
-   - Standardized `formatWppMessage` mapping to extract and expose critical media fields (`clientUrl`, `mediaKey`, `directPath`) and strip device suffixes from incoming JIDs.
-2. **REST & Socket.IO API Compatibility (`routes.ts` & `server.ts`)**:
-   - `/start-session`: Starts session, waits for pairing code, and returns `phoneCode` directly in HTTP JSON response + emits over Socket.IO `phoneCode` event.
-   - Socket.IO server running on port `6300` emitting `qrCode`, `phoneCode`, `status-find`, `session-logged`, `messages.upsert`, `onack`, and `onpresencechanged`.
-   - Implemented fast 1s state polling during the `INITIALIZING` phase and automatic status broadcasts upon client reconnects.
-3. **Automated Setup & Compilation (`setup_api.py`)**:
-   - Automatically syncs patches from `client/api_patches/` to `client/api/`.
-   - Auto-terminates stale background `node.exe` processes before building to ensure newly compiled code (`dist/server.js`) is loaded fresh in RAM.
+   - Stripped legacy translation functions (`_normalize_wpp_message`, `formatWppMessage`, `baileysStatusToAck`, `ack_to_status`).
+   - Standardized Socket.IO events to native Baileys payloads: `messages.upsert`, `messages.update`, `presence.update`, `chats.update`.
+   - Native JID handling (`@s.whatsapp.net`, `@g.us`, `@lid`) across REST and Socket.IO without arbitrary `@c.us` conversions.
+   - Automatic disk data wipe implemented on logout/pairing reset (`clear_local_data()`).
 
-### B. Python Desktop Client Overhaul (`client/`)
-1. **Connection Dialog (`client/ui/dialogs/connect.py`)**:
-   - Added automatic country dial code detection (`_detect_default_dial_code()`) via Windows GeoLocation (`GetUserDefaultGeoName`) & system locale (auto-selects `Pakistan (+92)` on PK systems instead of hardcoded `Brazil (+55)`).
-   - Added automatic leading zero stripping (e.g. `03001234567` + `92` -> `923001234567`), eliminating invalid 13-digit number mismatches.
-   - Fixed `_bg_pairing_flow` race condition where `close-session` was closing the active new session socket during pairing setup.
-   - Fixed `_call_start_session()` so `_phone_code_event.set()` is only called when an actual non-empty pairing code is received.
-2. **WebSocket Client (`client/core/websocket_client.py`)**:
-   - Added guard in `on_wpp_status_find` so status events (`notLogged`/`QRCODE`) are ignored while `_pairing_in_progress` is True. This prevents `show_connection_dial` from closing the open `pairing_dial` dialog.
-3. **History Sync & Contact Resolution (`client/main.py`)**:
-   - Added real-time synchronization progress updates (e.g., `Synchronizing... (X remaining)`) to the main application's status bar during history backfill.
-   - Integrated sync complete audio notifications and voice announcements when history backfilling successfully finishes.
-   - Optimized name resolution performance by reducing sleep delays from 500ms to 10ms, preventing GUI blocking and initialization lag.
-   - Implemented robust LID mapping to telephone JIDs for accurate sender name previews.
-4. **Media and Audio Processing (`client/main.py`)**:
-   - Added automated media format parsing fallbacks for downloading older/expired CDN media links.
-   - Integrated FFmpeg-based OGG/Opus audio conversion to WAV format to support native BASS audio engine playback.
-   - Fine-tuned audio settings for converting recorded WAV files back to high-compression Opus formats for transmission.
-5. **Legacy WPPConnect Cleanup (`client/main.py` & `client/updater.py`)**:
-   - Completely removed legacy WPPConnect 90-second GitHub update checker (`wx.CallLater(90000, self._start_wpp_update_checker)`).
-   - Neutered `ensure_wpp_version()`, `_check_wpp_version_pin()`, `_update_wpp_server()`, and `WppUpdateChecker._check_once()`.
+### Phase B — Critical Tracing & Fixes
 
----
+1. **Voice Message Immediate Send Failure Fix**:
+   - Extracted `msg_id` from canonical native message responses (`key.id`) instead of `resp.id` (which was `None`), fixing immediate status timeouts.
+   - Added WAV audio header detection (`RIFF`) and automatic mimetype fallback (`audio/wav`) in `sendVoiceBase64` so voice recording works even on systems without FFmpeg binaries.
+   - Configured FFmpeg Opus conversion to 48000 Hz Mono PTT standard (`-ar 48000 -b:a 32k`).
 
-## 3. Key Files Structure & Map
+2. **Phantom / Empty Chat List Clean-up**:
+   - Filtered out 1:1 and self chats from `getChats()` in `baileysManager.ts` that have no activity (`conversationTimestamp === 0`, no messages, no unread, not pinned).
+   - Resolved `@lid` JIDs using `lidToPhoneMap` to prevent duplicate unnamed phantom chats.
 
-| File Path | Description |
+3. **Pinned Chat Stability Fix**:
+   - Updated `chats.update` delta handling in `baileysManager.ts` to only include `pinned` property when explicitly modified, preventing unread or last-message updates from accidentally clearing pinned status.
+   - Fixed real-time `pinned` key detection in `websocket_client.py`.
+
+4. **Self-Chat & Group Participant Name Resolution**:
+   - Ensured self-chat (`isSelf`) is never skipped if it contains messages, and formatted it with proper display name.
+   - Added fallback to `store.contacts` inside `formatCanonicalMessage` for missing `pushName` values on group participant messages.
+
+5. **Read Receipt & Unread Sync**:
+   - Preserved clean native JIDs in `mark_conversation_as_read` (`main.py`).
+   - Added `store.chats.get(jid).unreadCount = 0` reset inside `sendSeen` in `baileysManager.ts`.
+
+6. **Socket Auto-Reconnect Safeguard**:
+   - Updated `connection === 'close'` handler in `baileysManager.ts` to emit `status-find` with `status: 'INITIALIZING'` (instead of `'DISCONNECTED'`) when `shouldReconnect: true`, preventing false logout triggers.
+
+7. **Process Management**:
+   - Enforced `taskkill /F /IM node.exe` in `setup_api.py` during builds to clear orphaned gateway processes.
+
+## Key files
+
+| File | Role |
 |---|---|
-| [`setup_api.py`](file:///d:/projects/WinZapp_Python/setup_api.py) | Setup script that compiles TypeScript patches in `client/api_patches/` to `client/api/dist/server.js`. |
-| [`start_api.py`](file:///d:/projects/WinZapp_Python/start_api.py) | Standalone launcher for the Node.js Baileys Gateway Server on port 6300. |
-| [`client/api_patches/src/baileysManager.ts`](file:///d:/projects/WinZapp_Python/client/api_patches/src/baileysManager.ts) | Core Baileys manager handling auth state, pairing codes, sockets, and session lifecycles. |
-| [`client/api_patches/src/routes.ts`](file:///d:/projects/WinZapp_Python/client/api_patches/src/routes.ts) | Express REST endpoints matching WPPConnect signatures for client compatibility. |
-| [`client/api_patches/src/server.ts`](file:///d:/projects/WinZapp_Python/client/api_patches/src/server.ts) | Express + Socket.IO server startup file with Node 18 crypto polyfills. |
-| [`client/main.py`](file:///d:/projects/WinZapp_Python/client/main.py) | Main Python desktop GUI application, tray, audio, accessibility, and app startup engine. |
-| [`client/ui/dialogs/connect.py`](file:///d:/projects/WinZapp_Python/client/ui/dialogs/connect.py) | Connection dialog UI, phone field input, country selector, and pairing code modal. |
-| [`client/core/websocket_client.py`](file:///d:/projects/WinZapp_Python/client/core/websocket_client.py) | Socket.IO client handling real-time events between Python and Gateway Server. |
+| `client/main.py` | Python wxPython UI + business logic (~14k lines). |
+| `client/core/websocket_client.py` | Socket.IO client, event normalization, live/historical routing. |
+| `client/core/database.py` / `database_bridge.py` | Async SQLite (aiosqlite) + sync façade. |
+| `client/core/message_queue.py` | Outgoing-send queue with ambiguous-failure handling. |
+| `client/ui/conversations.py` | Conversation list/panel rendering, voice recording/playback. |
+| `client/api_patches/src/` | **Source of truth** for the Baileys gateway (copied to `client/api/src/`, compiled to `dist/`). |
+| `client/api/` | Built gateway (git-ignored except `dist/`, `start.js`, `package.json`, `config.json`). |
+| `setup_api.py` | Sync `api_patches` → `api` + `npm install` + build + process kill. |
+| `build.py` | PyInstaller release build (onedir/onefile). |
 
----
+## How to run / build / test
 
-## 4. Operational Instructions for Developers / AI Agents
+```powershell
+# Dev run
+cd client; python main.py
 
-### How to Build & Run:
-1. **Rebuild Gateway Server**:
-   ```cmd
-   venv\Scripts\python.exe setup_api.py
-   ```
-2. **Run Desktop Client**:
-   ```cmd
-   venv\Scripts\python.exe client/main.py
-   ```
-3. **Run Test Suite**:
-   ```cmd
-   venv\Scripts\python.exe -m pytest tests/test_api_patches_in_sync.py tests/test_database.py tests/test_notifications.py
-   ```
+# Rebuild gateway after touching client/api_patches/src/
+venv\Scripts\python.exe setup_api.py
 
-### Important Verification Checklist:
-- All 84 pytest unit tests pass cleanly.
-- `client/api_patches/` files match compiled code in `client/api/dist/`.
-- No lingering `node.exe` processes lock port `6300`.
+# Tests (from repo root)
+pytest
+```

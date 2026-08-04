@@ -233,19 +233,27 @@ class TestTestInputDevice:
 
     def test_succeeds_on_the_first_supported_combo(self, monkeypatch):
         fake_pa = _FakePyAudio(accepted_configs={(48000, 1)})
+        import types
+        pa_mod = audio_devices_module.pyaudio or types.SimpleNamespace(PyAudio=None, paInt16=8)
+        monkeypatch.setattr(audio_devices_module, "pyaudio", pa_mod)
         monkeypatch.setattr(audio_devices_module.pyaudio, "PyAudio", lambda: fake_pa)
         assert audio_devices_module.test_input_device(5) is True
         assert fake_pa.opened_with == [(48000, 1)]
 
     def test_falls_back_to_a_later_combo(self, monkeypatch):
-        # Only the very last combo in the fallback chain works.
         fake_pa = _FakePyAudio(accepted_configs={(44100, 2)})
+        import types
+        pa_mod = audio_devices_module.pyaudio or types.SimpleNamespace(PyAudio=None, paInt16=8)
+        monkeypatch.setattr(audio_devices_module, "pyaudio", pa_mod)
         monkeypatch.setattr(audio_devices_module.pyaudio, "PyAudio", lambda: fake_pa)
         assert audio_devices_module.test_input_device(5) is True
         assert fake_pa.opened_with == audio_devices_module.RECORDING_SAMPLE_CONFIGS
 
     def test_fails_only_when_no_combo_is_supported(self, monkeypatch):
         fake_pa = _FakePyAudio(accepted_configs=set())
+        import types
+        pa_mod = audio_devices_module.pyaudio or types.SimpleNamespace(PyAudio=None, paInt16=8)
+        monkeypatch.setattr(audio_devices_module, "pyaudio", pa_mod)
         monkeypatch.setattr(audio_devices_module.pyaudio, "PyAudio", lambda: fake_pa)
         assert audio_devices_module.test_input_device(5) is False
         assert fake_pa.opened_with == audio_devices_module.RECORDING_SAMPLE_CONFIGS

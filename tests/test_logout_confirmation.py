@@ -178,7 +178,7 @@ def test_works_without_prior_initialisation(monkeypatch):
     class _Bare:
         _LOGOUT_CONFIRM_STRIKES = 2
         _LOGOUT_CONFIRM_SECONDS = 60
-        _LOGOUT_STARTUP_GRACE_SECONDS = 240
+        _LOGOUT_STARTUP_GRACE_SECONDS = 50
         _logout_confirmed = MainWindow._logout_confirmed
 
         def _still_linked_on_server(self):
@@ -188,4 +188,6 @@ def test_works_without_prior_initialisation(monkeypatch):
     monkeypatch.setattr("main.time.time", lambda: 10_000.0)
     assert b._logout_confirmed("QRCODE") is False
     monkeypatch.setattr("main.time.time", lambda: 10_100.0)
+    assert b._logout_confirmed("QRCODE") is False
+    monkeypatch.setattr("main.time.time", lambda: 10_200.0)
     assert b._logout_confirmed("QRCODE") is True

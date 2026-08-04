@@ -89,3 +89,36 @@ def test_missing_attribute_is_treated_as_not_started():
     stub = _Stub()
     del stub._sync_ever_started
     assert stub.ready() is False
+
+
+# ── History backfill gate ───────────────────────────────────────────────────
+# _history_events_ready() is deliberately LOOSER than _live_events_ready():
+# on_historical_message() has no unread/sound/notification side effects, so it
+# is safe as soon as the UI (and therefore self.chats/self.db) exists — even
+# before the sync thread has latched _sync_ever_started. The full-history
+# messaging-history stream can start the instant the socket connects; dropping
+# those early messages lost history permanently, because the sync only
+# re-fetches the newest page per chat.
+
+class _HistoryStub:
+    def __init__(self, ui_ready=True):
+        self._ui_ready_event = threading.Event()
+        if ui_ready:
+            self._ui_ready_event.set()
+
+    history_ready = MainWindow._history_events_ready
+
+
+def test_history_dropped_before_ui_exists():
+    """The one thing both gates must reject: no self.db/self.chats yet."""
+    assert _HistoryStub(ui_ready=False).history_ready() is False
+
+
+def test_history_accepted_before_any_sync_has_started():
+    """The whole point of the looser gate: the full-history stream can arrive
+    before the sync thread latches _sync_ever_started, and must be kept."""
+    assert _HistoryStub(ui_ready=True).history_ready() is True
+
+
+def test_history_accepted_once_ui_is_up_even_with_no_sync_ever():
+    assert _HistoryStub(ui_ready=True).history_ready() is True

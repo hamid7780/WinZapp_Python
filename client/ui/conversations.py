@@ -919,14 +919,24 @@ class ConversationsPanel(wx.Panel):
 
         _conv_jid = conversation.get("remoteJid", "")
         self._last_open_jid = _conv_jid
-        self.conversation_name = (
+        _header_name = (
             self.main_window._resolve_contact_name(conversation)
             or self.main_window.find_name_through_messages(conversation)
             or conversation.get("name", "")
             or ("" if _conv_jid.endswith("@g.us") else conversation.get("pushName", ""))
             or self.main_window.find_jid_through_messages(conversation)
             or self.main_window._format_jid_for_display(_conv_jid)
-            or (self.main_window.i18n.t("unknown_group") if _conv_jid.endswith("@g.us") else self.main_window.i18n.t("unknown_contact"))
+        )
+        # Filter placeholders the chat list already rejects (e.g. a stored
+        # "Unknown User"/"Contato sem nome") — otherwise a header shows the
+        # placeholder literally while the chat list shows a real name or a
+        # number. Matches _compute_chat_lists()'s own bad-name gate.
+        if _header_name and self.main_window._is_bad_contact_name(_header_name):
+            _header_name = ""
+        self.conversation_name = (
+            _header_name
+            or (self.main_window.i18n.t("unknown_group") if _conv_jid.endswith("@g.us")
+                else self.main_window.i18n.t("unknown_contact"))
         )
         jid      = conversation.get("remoteJid", "")
         is_group = jid.endswith("@g.us")
@@ -1664,11 +1674,18 @@ class ConversationsPanel(wx.Panel):
 
         self._recording_frames = []
         self._recording_paused = False
+        self._mic_ready = threading.Event()
 
         # Define callback once, outside the loop; captures self for pause check.
         def _callback(in_data, frame_count, time_info, status):
             # Runs on PyAudio's internal callback thread.
             # list.append is atomic under the GIL — no explicit lock needed.
+            # Capture the audio! This callback previously never appended
+            # in_data, so on any machine using the PyAudio path (as opposed to
+            # the sounddevice fallback) _recording_frames stayed empty and
+            # every voice recording was silently discarded at send time.
+            if not self._recording_paused:
+                self._recording_frames.append(in_data)
             if status:
                 # paInputOverflow: the capture buffer filled before we drained
                 # it (CPU/GIL contention). Logged so choppy recordings are
@@ -1721,6 +1738,8 @@ class ConversationsPanel(wx.Panel):
                         self._recording_stream = sd_stream
                     except Exception as err:
                         logging.error("[audio] Async sounddevice InputStream error: %s", err)
+                    finally:
+                        self._mic_ready.set()
                 threading.Thread(target=_bg_start_mic, daemon=True).start()
                 return
             except Exception as sd_exc:
@@ -1781,6 +1800,7 @@ class ConversationsPanel(wx.Panel):
         self._recording_actual_ch   = ch
 
         self._is_recording = True
+        self._mic_ready.set()
 
         # UI: play sound, swap buttons, focus the configured recording action.
         self.main_window.voicemsg_startrecording_sound.play()
@@ -1807,6 +1827,8 @@ class ConversationsPanel(wx.Panel):
 
     def _stop_recording_stream(self):
         """Stop and close the active stream (safe to call when None)."""
+        if hasattr(self, '_mic_ready'):
+            self._mic_ready.wait(timeout=2.0)
         if hasattr(self, "_sd_stream") and self._sd_stream:
             try:
                 self._sd_stream.stop()
@@ -1876,11 +1898,15 @@ class ConversationsPanel(wx.Panel):
         _t0 = _time.perf_counter()
         logging.info("[VOICE_TIMING] T+0.000s — user clicked send, stopping recording stream")
 
+        frames = self._recording_frames
+        self._recording_frames = []
+
+        self._is_recording     = False
+        self._recording_paused = False
+
         # Stop the recording stream in background FIRST so the audio device is fully released
         # without blocking the UI thread before BASS plays the send sound.
         threading.Thread(target=self._stop_recording_stream, daemon=True).start()
-        self._is_recording     = False
-        self._recording_paused = False
 
         self.main_window.voicemsg_send_sound.play()
 
@@ -1889,10 +1915,9 @@ class ConversationsPanel(wx.Panel):
         if _rec_jid and not _rec_jid.endswith("@newsletter"):
             self.main_window.send_recording_status(_rec_jid, False, _rec_jid.endswith("@g.us"))
 
-        frames = self._recording_frames
-        self._recording_frames = []
-
         if not frames:
+            logging.warning("[_send_voice_message] No audio frames captured — mic may be blocked or recording was too short")
+            self.main_window.voicemsg_discard_sound.play()
             self._hide_voice_panel()
             self.message_field.SetFocus()
             return
@@ -2038,7 +2063,7 @@ class ConversationsPanel(wx.Panel):
                          _time.perf_counter() - _t0,
                          "yes" if ogg_bytes else "NO — will fallback to WAV")
             pm = PendingMessage(local_id, remote_jid, audio_path=wav_path,
-                                ogg_bytes=ogg_bytes, quoted=quoted_msg)
+                                ogg_bytes=ogg_bytes, quoted=quoted_msg, duration=duration_sec)
             mw.message_queue.enqueue(pm)
 
         threading.Thread(target=_write_and_enqueue, daemon=True).start()
@@ -5158,6 +5183,17 @@ class ConversationsPanel(wx.Panel):
         # Never use the group JID itself as a display name for a message sender.
         if phone_jid and not phone_jid.endswith("@lid") and not phone_jid.endswith("@g.us"):
             return format_number(phone_jid)
+
+        # A group participant whose @lid has no phone mapping and no pushName
+        # on the message used to render a blank sender (`": body"`). Delegate to
+        # the richer resolution chain (_get_participant_name), which tries
+        # contacts/chat dicts/presence map/participant cache and finally a
+        # numeric fallback, before giving up on a blank label.
+        if participant and participant.endswith("@lid"):
+            resolved = self._get_participant_name(participant, msg)
+            if resolved:
+                return resolved
+
         return ""
 
     def _is_separator(self, msg: dict) -> bool:
@@ -6033,8 +6069,14 @@ class ConversationsPanel(wx.Panel):
                     mw.register_jid_mapping(participant_jid, phone)
         if phone:
             return format_number(phone)
-        # No phone mapping for this @lid — return just the local part (strip "@lid")
-        # so the display shows the raw identifier without the domain suffix.
+        # Check if pushName is carried in msg or presence map
+        if isinstance(msg, dict):
+            p_name = msg.get("pushName") or msg.get("pushname") or msg.get("displayName") or ""
+            if p_name and not mw._is_bad_contact_name(p_name):
+                return p_name
+        p_name = (ppm.get(participant_jid) or "").strip()
+        if p_name and not mw._is_bad_contact_name(p_name):
+            return p_name
         return participant_jid.rsplit("@", 1)[0]
 
 
