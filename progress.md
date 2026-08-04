@@ -12,12 +12,15 @@ WinZapp has been migrated from legacy **WPPConnect** (heavy Puppeteer / Headless
 ### A. Node.js Baileys Gateway Server (`client/api_patches/src/`)
 1. **Baileys WebSocket Manager (`baileysManager.ts`)**:
    - Integrated `@whiskeysockets/baileys` with `useMultiFileAuthState`.
+   - Enabled full history synchronization (`syncFullHistory: true`) to ensure all messages are fetched during initialization.
    - Added `getSafeSessionName()` to sanitize session strings and strip colons (`:`), preventing Windows NTFS folder creation failures (`ENOENT`).
    - Implemented direct 8-digit Phone Pairing Code generation via `sock.requestPairingCode(phone)`.
    - Added Node.js v18 Web Crypto polyfill (`globalThis.crypto = crypto.webcrypto || crypto`) at the very top of `server.ts` and `baileysManager.ts`, resolving `ReferenceError: crypto is not defined`.
+   - Standardized `formatWppMessage` mapping to extract and expose critical media fields (`clientUrl`, `mediaKey`, `directPath`) and strip device suffixes from incoming JIDs.
 2. **REST & Socket.IO API Compatibility (`routes.ts` & `server.ts`)**:
    - `/start-session`: Starts session, waits for pairing code, and returns `phoneCode` directly in HTTP JSON response + emits over Socket.IO `phoneCode` event.
    - Socket.IO server running on port `6300` emitting `qrCode`, `phoneCode`, `status-find`, `session-logged`, `messages.upsert`, `onack`, and `onpresencechanged`.
+   - Implemented fast 1s state polling during the `INITIALIZING` phase and automatic status broadcasts upon client reconnects.
 3. **Automated Setup & Compilation (`setup_api.py`)**:
    - Automatically syncs patches from `client/api_patches/` to `client/api/`.
    - Auto-terminates stale background `node.exe` processes before building to ensure newly compiled code (`dist/server.js`) is loaded fresh in RAM.
@@ -30,7 +33,16 @@ WinZapp has been migrated from legacy **WPPConnect** (heavy Puppeteer / Headless
    - Fixed `_call_start_session()` so `_phone_code_event.set()` is only called when an actual non-empty pairing code is received.
 2. **WebSocket Client (`client/core/websocket_client.py`)**:
    - Added guard in `on_wpp_status_find` so status events (`notLogged`/`QRCODE`) are ignored while `_pairing_in_progress` is True. This prevents `show_connection_dial` from closing the open `pairing_dial` dialog.
-3. **Legacy WPPConnect Cleanup (`client/main.py` & `client/updater.py`)**:
+3. **History Sync & Contact Resolution (`client/main.py`)**:
+   - Added real-time synchronization progress updates (e.g., `Synchronizing... (X remaining)`) to the main application's status bar during history backfill.
+   - Integrated sync complete audio notifications and voice announcements when history backfilling successfully finishes.
+   - Optimized name resolution performance by reducing sleep delays from 500ms to 10ms, preventing GUI blocking and initialization lag.
+   - Implemented robust LID mapping to telephone JIDs for accurate sender name previews.
+4. **Media and Audio Processing (`client/main.py`)**:
+   - Added automated media format parsing fallbacks for downloading older/expired CDN media links.
+   - Integrated FFmpeg-based OGG/Opus audio conversion to WAV format to support native BASS audio engine playback.
+   - Fine-tuned audio settings for converting recorded WAV files back to high-compression Opus formats for transmission.
+5. **Legacy WPPConnect Cleanup (`client/main.py` & `client/updater.py`)**:
    - Completely removed legacy WPPConnect 90-second GitHub update checker (`wx.CallLater(90000, self._start_wpp_update_checker)`).
    - Neutered `ensure_wpp_version()`, `_check_wpp_version_pin()`, `_update_wpp_server()`, and `WppUpdateChecker._check_once()`.
 
