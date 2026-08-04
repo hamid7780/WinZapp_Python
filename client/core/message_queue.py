@@ -31,7 +31,8 @@ class PendingMessage:
                  caption: str = None,
                  contact_info: dict = None,
                  quoted: dict = None,
-                 mentioned_jids: list = None):
+                 mentioned_jids: list = None,
+                 duration: int = 0):
         # local_id matches the "_local_id" field in the virtual message dict
         # that was already added to the UI.
         self.local_id      = local_id
@@ -45,6 +46,7 @@ class PendingMessage:
         self.contact_info  = contact_info   # dict for contact attachment
         self.quoted        = quoted         # quoted/replied-to message dict
         self.mentioned_jids = mentioned_jids or []  # JIDs @mentioned in text
+        self.duration      = duration      # voice message duration in seconds
         self.fail_count    = 0             # consecutive send failures
         self.last_error    = ""            # last send error shown if retries exhaust
 
@@ -121,7 +123,7 @@ class MessageQueue:
                     if msg.audio_path:
                         real_id = self.main_window.send_audio_message(
                             msg.jid, msg.audio_path, quoted=msg.quoted,
-                            ogg_bytes=msg.ogg_bytes,
+                            ogg_bytes=msg.ogg_bytes, duration=msg.duration,
                         )
                     elif msg.media_path:
                         real_id = self.main_window.send_media_attachment(
@@ -149,6 +151,21 @@ class MessageQueue:
                             disconnected      = bool(real_id.get("disconnected"))
                             ambiguous         = bool(real_id.get("ambiguous"))
                             real_id = False
+
+                    # Register the real ID immediately so the WebSocket echo
+                    # (messages.upsert with fromMe=True) is recognised as
+                    # "sent by this instance" and not shown as a new message.
+                    if isinstance(real_id, str):
+                        with self.main_window._own_sent_ids_lock:
+                            self.main_window._own_sent_ids.add(real_id)
+                            if not hasattr(self.main_window, '_own_sent_ids_order'):
+                                import collections
+                                self.main_window._own_sent_ids_order = collections.deque(self.main_window._own_sent_ids)
+                            self.main_window._own_sent_ids_order.append(real_id)
+                            # Prevent unbounded growth — keep at most 500 IDs.
+                            while len(self.main_window._own_sent_ids_order) > 500:
+                                oldest = self.main_window._own_sent_ids_order.popleft()
+                                self.main_window._own_sent_ids.discard(oldest)
 
                     if not real_id and disconnected:
                         # WhatsApp is down and told us so explicitly (HTTP 404
@@ -183,17 +200,6 @@ class MessageQueue:
                         msg.fail_count = 0
                         with self._lock:
                             self._pending.pop(msg.local_id, None)
-                        # Register the real ID immediately so the WebSocket echo
-                        # (messages.upsert with fromMe=True) is recognised as
-                        # "sent by this instance" and not shown as a new message.
-                        if isinstance(real_id, str):
-                            with self.main_window._own_sent_ids_lock:
-                                self.main_window._own_sent_ids.add(real_id)
-                                # Prevent unbounded growth — keep at most 500 IDs.
-                                if len(self.main_window._own_sent_ids) > 500:
-                                    self.main_window._own_sent_ids.discard(
-                                        next(iter(self.main_window._own_sent_ids))
-                                    )
                         wx.CallAfter(
                             self.main_window._on_message_sent,
                             msg.local_id,

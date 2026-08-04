@@ -66,7 +66,7 @@ def main():
 
     for root, dirs, files in os.walk(API_PATCHES_DIR):
         rel_dir = os.path.relpath(root, API_PATCHES_DIR)
-        if rel_dir == "dist" or rel_dir == "node_modules":
+        if rel_dir == "dist" or rel_dir.startswith("dist") or rel_dir == "node_modules" or rel_dir.startswith("node_modules"):
             continue
         dest_dir = os.path.join(CLIENT_API_DIR, rel_dir) if rel_dir != "." else CLIENT_API_DIR
         os.makedirs(dest_dir, exist_ok=True)

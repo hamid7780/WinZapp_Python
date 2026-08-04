@@ -71,21 +71,13 @@ class WebSocketClient:
         self.sio.on("disconnect", self.on_disconnect)
         self.sio.on("qrCode", self.on_wpp_qrcode)
         self.sio.on("session-logged", self.on_wpp_session_logged)
-        self.sio.on("received-message", self.on_wpp_message_received)
-        self.sio.on("onack", self.on_wpp_ack)
+        self.sio.on("messages.upsert", self.on_messages_upsert)
+        self.sio.on("messages.set", self.on_messages_set)
         self.sio.on("phoneCode", self.on_wpp_phone_code)
         self.sio.on("status-find", self.on_wpp_status_find)
-        self.sio.on("onpresencechanged", self.on_wpp_presence_changed)
+        self.sio.on("chats.update", self.on_chats_update)
         self.sio.on("chats-update", self.on_chats_update)
         self.sio.on("messages.update", self.on_messages_update)
-        self.sio.on("onreactionmessage", self.on_wpp_reaction)
-        # These two handlers existed but were never registered — contact
-        # name/photo updates and presence changes only ever reached the app
-        # through onpresencechanged and the 5-minute contacts poll, so a
-        # renamed contact or a fresh presence event could sit stale for
-        # minutes. Registering them is a no-op if WPPConnect never actually
-        # emits these two event names (both bodies are already wrapped in
-        # try/except), so there is nothing to lose by listening for them too.
         self.sio.on("contacts.update", self.on_contacts_update)
         self.sio.on("presence.update", self.on_presence_update)
 
@@ -96,15 +88,6 @@ class WebSocketClient:
 
         # Debounce timer for on_disconnect() — see that method.
         self._disconnect_timer = None
-
-    def _clean_jid(self, jid_val):
-        if not jid_val:
-            return ""
-        if isinstance(jid_val, dict):
-            jid_val = jid_val.get("_serialized") or jid_val.get("id") or ""
-        if not isinstance(jid_val, str):
-            jid_val = str(jid_val)
-        return jid_val.replace("@c.us", "@s.whatsapp.net")
 
     def on_connect(self):
         logging.info("[WebSocketClient] WebSocket connected.")
@@ -659,73 +642,82 @@ class WebSocketClient:
         Handle real-time incoming messages from the WPPConnect.
 
         In WPPConnect v2 the websocket envelope is
-          {"event": "messages.upsert", "instance": ..., "data": {<message>}, ...}
-        where "data" is a single message object (key, pushName, message,
-        messageType, messageTimestamp, ...).
+          {"event": "messages.upsert", "instance": ..., "data": <message_or_list>, ...}
+        where "data" is either a single message dict OR an array of messages
+        (the gateway batches historical messages into arrays of up to 50).
         """
         try:
-            # Process real-time messages directly. Main window's on_new_message
-            # already deduplicates based on the message ID to prevent duplicate historical entries.
+            raw_data = info.get("data", {})
 
-            msg = info.get("data", {})
-            if not isinstance(msg, dict) or not msg.get("key"):
+            # Normalise to a list: the gateway may emit a single message dict
+            # (live traffic) OR an array of messages (batched history sync).
+            if isinstance(raw_data, list):
+                messages = [m for m in raw_data if isinstance(m, dict) and m.get("key")]
+            elif isinstance(raw_data, dict) and raw_data.get("key"):
+                messages = [raw_data]
+            else:
                 return
 
-            # ── Skip history-sync echoes ───────────────────────────────────────
-            # WPPConnect/Baileys fires messages.upsert for historical messages
-            # (isMdHistoryMsg=True) during its initial sync phase. These are
-            # normally the same records already fetched by sync_chat_messages via
-            # the REST API and placed in the correct chronological position, so
-            # treating them as live new messages would append them at the bottom
-            # of the conversation as if they had just been sent — dispatch them
-            # to the historical handler to be saved silently instead.
-            #
-            # BUT: this assumption only holds for a chat that hasn't been synced
-            # yet (not present in self.chats). Once a chat is already in the
-            # list, WPPConnect can still tag a genuinely new, real-time message
-            # with isMdHistoryMsg=True (observed in practice) — silently routing
-            # it to on_historical_message would save it without a notification,
-            # sound, or unread-count bump, effectively "losing" it from the
-            # user's point of view. So: only take the silent path for chats not
-            # yet in the list; an already-listed chat always gets full live
-            # treatment regardless of the flag.
-            if msg.get("isMdHistoryMsg"):
-                key = msg.get("key", {})
-                remote_jid = self.main_window._normalize_jid(key.get("remoteJid", ""))
-                if remote_jid not in self.main_window.chats:
-                    wx.CallAfter(self.main_window.on_historical_message, msg)
-                    return
-                # Chat already known/synced — fall through to live handling below.
-
-            # Extract JID mapping from WebSocket message
-            self.main_window._extract_lid_mapping(msg)
-            # fromMe=True can mean two things:
-            #   (a) WinZapp sent this message via MessageQueue — already rendered
-            #       in the UI; the WebSocket echo must be ignored.
-            #   (b) The user sent this message from another device (phone, official
-            #       Windows app) — must be added to the conversation like any
-            #       incoming message (but without playing a notification sound).
-            # We distinguish the two cases via _own_sent_ids, which is populated
-            # by MessageQueue immediately after the API returns the real message ID.
-            if msg.get("key", {}).get("fromMe", False):
-                # Own reactions are applied optimistically in _on_own_reaction_sent;
-                # suppress the WebSocket echo so the reaction count isn't doubled.
-                if msg.get("messageType") == "reactionMessage":
-                    return
-                msg_id = msg.get("key", {}).get("id", "")
-                _lock = getattr(self.main_window, "_own_sent_ids_lock", None)
-                if _lock is not None:
-                    with _lock:
-                        _is_own = msg_id and msg_id in self.main_window._own_sent_ids
-                else:
-                    _is_own = msg_id and msg_id in getattr(self.main_window, "_own_sent_ids", set())
-                if _is_own:
-                    return  # echo of our own send — skip
-                # Otherwise: sent from another device — fall through to on_new_message
-            wx.CallAfter(self.main_window.on_new_message, msg)
+            for msg in messages:
+                self._process_single_upsert(msg)
 
         except Exception:
             logging.exception("[WebSocketClient] on_messages_upsert error")
+
+    def _process_single_upsert(self, msg: dict):
+        """Process a single messages.upsert message dict."""
+        # ── Skip history-sync echoes ───────────────────────────────────────
+        # WPPConnect/Baileys fires messages.upsert for historical messages
+        # (isMdHistoryMsg=True) during its initial sync phase. These are
+        # normally the same records already fetched by sync_chat_messages via
+        # the REST API and placed in the correct chronological position, so
+        # treating them as live new messages would append them at the bottom
+        # of the conversation as if they had just been sent — dispatch them
+        # to the historical handler to be saved silently instead.
+        #
+        # BUT: this assumption only holds for a chat that hasn't been synced
+        # yet (not present in self.chats). Once a chat is already in the
+        # list, WPPConnect can still tag a genuinely new, real-time message
+        # with isMdHistoryMsg=True (observed in practice) — silently routing
+        # it to on_historical_message would save it without a notification,
+        # sound, or unread-count bump, effectively "losing" it from the
+        # user's point of view. So: only take the silent path for chats not
+        # yet in the list; an already-listed chat always gets full live
+        # treatment regardless of the flag.
+        if msg.get("isMdHistoryMsg"):
+            key = msg.get("key", {})
+            remote_jid = self.main_window._normalize_jid(key.get("remoteJid", ""))
+            if remote_jid not in self.main_window.chats:
+                wx.CallAfter(self.main_window.on_historical_message, msg)
+                return
+            # Chat already known/synced — fall through to live handling below.
+
+        # Extract JID mapping from WebSocket message
+        self.main_window._extract_lid_mapping(msg)
+        # fromMe=True can mean two things:
+        #   (a) WinZapp sent this message via MessageQueue — already rendered
+        #       in the UI; the WebSocket echo must be ignored.
+        #   (b) The user sent this message from another device (phone, official
+        #       Windows app) — must be added to the conversation like any
+        #       incoming message (but without playing a notification sound).
+        # We distinguish the two cases via _own_sent_ids, which is populated
+        # by MessageQueue immediately after the API returns the real message ID.
+        if msg.get("key", {}).get("fromMe", False):
+            # Own reactions are applied optimistically in _on_own_reaction_sent;
+            # suppress the WebSocket echo so the reaction count isn't doubled.
+            if msg.get("messageType") == "reactionMessage":
+                return
+            msg_id = msg.get("key", {}).get("id", "")
+            _lock = getattr(self.main_window, "_own_sent_ids_lock", None)
+            if _lock is not None:
+                with _lock:
+                    _is_own = msg_id and msg_id in self.main_window._own_sent_ids
+            else:
+                _is_own = msg_id and msg_id in getattr(self.main_window, "_own_sent_ids", set())
+            if _is_own:
+                return  # echo of our own send — skip
+            # Otherwise: sent from another device — fall through to on_new_message
+        wx.CallAfter(self.main_window.on_new_message, msg)
 
     def on_messages_update(self, info):
         """
@@ -771,6 +763,7 @@ class WebSocketClient:
                 jid = chat_update.get("remoteJid") or chat_update.get("id", "")
                 if not jid:
                     continue
+                jid = self.main_window._normalize_jid(jid)
                 unread = chat_update.get("unreadCount")
                 if unread is not None:
                     wx.CallAfter(self.main_window.on_chat_unread_update, jid, int(unread))
@@ -785,9 +778,15 @@ class WebSocketClient:
                     if archived_flag is not None:
                         wx.CallAfter(self.main_window.on_chat_archive_update, jid, archived_flag)
 
-                # Handle pin/unpin updates in real-time
-                pin = chat_update.get("pin")
-                if pin is not None:
+                # Handle pin/unpin updates in real-time. Act whenever the update
+                # carries a `pin` field AT ALL — an explicit null/0 means the
+                # chat was unpinned and must not be ignored, or a stale pin
+                # lingers until the next 60s list-chats poll (and even then only
+                # if the poll's own reconciliation fires). An update that simply
+                # omits the key (e.g. an unreadCount-only delta) is not a pin
+                # change and is skipped.
+                if "pinned" in chat_update or "pin" in chat_update:
+                    pin = chat_update.get("pinned") if "pinned" in chat_update else chat_update.get("pin")
                     if isinstance(pin, str):
                         if pin.lower() == "true": pin = True
                         elif pin.lower() == "false": pin = False
@@ -804,7 +803,9 @@ class WebSocketClient:
                         # data, so any genuine value is always far above this,
                         # but keeping both call sites on the same threshold
                         # avoids the two ever disagreeing on a borderline value.
-                        is_pinned = pin > 1_000_000
+                        is_pinned = pin > 0
+                    # pin absent-or-null here means unpinned (the field was
+                    # explicitly cleared), so is_pinned stays False.
                     wx.CallAfter(self.main_window.on_chat_pin_update, jid, is_pinned)
         except Exception:
             logging.exception("[WebSocketClient] on_chats_update error")
@@ -829,87 +830,7 @@ class WebSocketClient:
         except Exception:
             logging.exception("[WebSocketClient] on_presence_update error")
 
-    def on_wpp_presence_changed(self, info):
-        """
-        Handle WPPConnect onpresencechanged event.
-        Payload format matches PresenceChangeEvent from WPPConnect.
-        """
-        if not info or not isinstance(info, dict):
-            return
-        try:
-            # The id can be a string or a dict/object (Wid)
-            raw_id = info.get("id")
-            if isinstance(raw_id, dict):
-                chat_jid = raw_id.get("_serialized", "")
-            else:
-                chat_jid = str(raw_id or "")
 
-            if not chat_jid:
-                return
-
-            is_group = bool(info.get("isGroup", False))
-            
-            # We want to format this into the presences dict that main.py expects:
-            # presences: {participant_jid: {"lastKnownPresence": state, "lastSeen": timestamp}}
-            presences = {}
-            
-            # Map state to expected values (available, unavailable, composing, recording).
-            # Per WPPConnect's own PresenceEvent type, "state" is one of:
-            # 'available' | 'composing' | 'recording' | 'unavailable'. Older/alternate
-            # builds have been seen using "online"/"offline"/"typing" instead, so those
-            # are normalised here too.
-            def map_state(s):
-                if not s:
-                    return "unavailable"
-                s = s.strip().lower()
-                if s == "online":
-                    return "available"
-                if s == "offline":
-                    return "unavailable"
-                # WPPConnect/WhatsApp Web uses "typing" where Baileys uses "composing"
-                if s == "typing":
-                    return "composing"
-                # Map WPPConnect recording_audio to recording
-                if s == "recording_audio":
-                    return "recording"
-                if s not in ("available", "unavailable", "composing", "recording", "paused"):
-                    # Unknown/unexpected chat-state value — log it so a real-world
-                    # mismatch (e.g. a different literal used for audio recording)
-                    # can be diagnosed from the logs instead of failing silently.
-                    logging.warning(f"[WebSocketClient] Unrecognized presence state: {s!r} (raw info: {info})")
-                return s
-
-            timestamp = info.get("t")
-
-            if is_group:
-                participants = info.get("participants", [])
-                if isinstance(participants, list):
-                    for p in participants:
-                        if not isinstance(p, dict):
-                            continue
-                        p_raw_id = p.get("id")
-                        if isinstance(p_raw_id, dict):
-                            p_jid = p_raw_id.get("_serialized", "")
-                        else:
-                            p_jid = str(p_raw_id or "")
-                        if p_jid:
-                            p_state = map_state(p.get("state"))
-                            presences[p_jid] = {
-                                "lastKnownPresence": p_state,
-                                "lastSeen": timestamp
-                            }
-            else:
-                state = map_state(info.get("state"))
-                presences[chat_jid] = {
-                    "lastKnownPresence": state,
-                    "lastSeen": timestamp
-                }
-
-            if presences:
-                logging.info(f"[WebSocketClient] on_wpp_presence_changed JID: {chat_jid}, presences: {presences}")
-                wx.CallAfter(self.main_window.on_presence_update, chat_jid, presences)
-        except Exception:
-            logging.exception("[WebSocketClient] on_wpp_presence_changed error")
 
     def on_contacts_update(self, info):
         """
@@ -1140,585 +1061,7 @@ class WebSocketClient:
                 )
                 self._phone_code_value = str(code)
                 self._phone_code_event.set()
-                # WPPConnect requests a fresh pairing code whenever WhatsApp
-                # rotates the auth ref, invalidating the previous one. Refresh
-                # the pairing dialog (if open) so the user never types a stale
-                # code.
                 if self.connect:
                     wx.CallAfter(self.connect.update_pairing_code, str(code))
         except Exception:
             logging.exception("[WebSocketClient] on_wpp_phone_code error")
-
-
-    def on_wpp_message_received(self, data):
-        try:
-            if not isinstance(data, dict):
-                return
-            wpp_msg = data.get("response")
-            if not wpp_msg:
-                return
-            normalized = self._normalize_wpp_message(wpp_msg)
-            self.on_messages_upsert({"data": normalized})
-        except Exception:
-            # A message is dropped entirely if this raises — log the full
-            # traceback (not just str(e)) so a future normalization bug is
-            # diagnosable from the logs instead of a message just vanishing
-            # with no trace of why.
-            logging.exception("[WebSocketClient] on_wpp_message_received error")
-
-    def on_wpp_reaction(self, data):
-        """Handle the 'onreactionmessage' Socket.IO event.
-
-        WPPConnect emits reactions on a dedicated channel (NOT received-message),
-        with the shape: {id, msgId, reactionText, timestamp, ...}.
-          - `msgId` is the serialized id of the *reacted-to* message
-            (`<fromMe>_<chatId>_<id>[_<participant>]`) — a `true_` prefix means
-            the reaction targets one of YOUR messages.
-          - `id` is the serialized id of the reaction itself; its `<fromMe>`
-            prefix tells whether YOU are the one reacting, and its trailing
-            participant (in groups) identifies the reactor.
-
-        We rebuild the Baileys-style reactionMessage structure the rest of the
-        app expects and route it through on_new_message, which updates the live
-        display and fires a notification when someone reacts to your message.
-        """
-        try:
-            if not isinstance(data, dict):
-                return
-            payload = data.get("response") if isinstance(data.get("response"), dict) else data
-            emoji = (payload.get("reactionText") or payload.get("text") or "").strip()
-            target_serialized = payload.get("msgId")
-            if isinstance(target_serialized, dict):
-                target_serialized = target_serialized.get("_serialized", "")
-            reaction_serialized = payload.get("id")
-            if isinstance(reaction_serialized, dict):
-                reaction_serialized = reaction_serialized.get("_serialized", "")
-            if not target_serialized:
-                return
-
-            def _split(serialized):
-                parts = str(serialized).split("_")
-                from_me = parts[0] == "true"
-                chat = self._clean_jid(parts[1]) if len(parts) > 1 else ""
-                clean_id = parts[2] if len(parts) > 2 else (parts[-1] if parts else "")
-                participant = self._clean_jid(parts[3]) if len(parts) > 3 else ""
-                return from_me, chat, clean_id, participant
-
-            target_from_me, chat_jid, target_id, _ = _split(target_serialized)
-            reactor_from_me, r_chat, reaction_id, reactor_participant = _split(
-                reaction_serialized or ""
-            )
-            if reactor_from_me:
-                return  # own reaction — applied optimistically, ignore the echo
-            if not chat_jid:
-                chat_jid = r_chat
-
-            normalized = {
-                "key": {
-                    "remoteJid": chat_jid,
-                    "fromMe": False,
-                    "id": reaction_id,
-                },
-                "pushName": "",
-                "message": {
-                    "reactionMessage": {
-                        "text": emoji,
-                        "key": {
-                            "id": target_id,
-                            "fromMe": target_from_me,
-                            "remoteJid": chat_jid,
-                        },
-                    }
-                },
-                "messageType": "reactionMessage",
-                "messageTimestamp": (payload.get("timestamp") // 1000 if (payload.get("timestamp") or 0) > 1_000_000_000_000 else (payload.get("timestamp") or int(time.time()))),
-            }
-            if reactor_participant:
-                normalized["key"]["participant"] = reactor_participant
-            wx.CallAfter(self.main_window.on_new_message, normalized)
-        except Exception:
-            logging.exception("[WebSocketClient] on_wpp_reaction error")
-
-    def on_wpp_ack(self, data):
-        try:
-            if not isinstance(data, dict):
-                return
-            wpp_ack = data.get("ack")
-            status = ack_to_status(wpp_ack)
-            if status is None:
-                logging.warning("[WebSocketClient] on_wpp_ack: unrecognised ack %r — "
-                                "leaving the message status untouched", wpp_ack)
-                return
-            msg_id = data.get("id", {}).get("_serialized") if isinstance(data.get("id"), dict) else data.get("id")
-            parts = msg_id.split("_") if msg_id else []
-            clean_id = parts[2] if len(parts) > 2 else (parts[-1] if parts else msg_id)
-            if not clean_id:
-                logging.warning("[WebSocketClient] on_wpp_ack: ack %r with no usable message id "
-                                "(raw id=%r) — dropping", wpp_ack, data.get("id"))
-                return
-
-            remote_jid = data.get("to")
-            if not remote_jid and isinstance(data.get("id"), dict):
-                remote_jid = data.get("id", {}).get("remote")
-            if not remote_jid and len(parts) > 1:
-                remote_jid = parts[1]
-            if remote_jid:
-                remote_jid = self._clean_jid(remote_jid)
-
-            self.on_messages_update({
-                "data": {
-                    "key": {
-                        "id": clean_id,
-                        "remoteJid": remote_jid or "",
-                        "fromMe": True
-                    },
-                    "update": {
-                        "status": status
-                    }
-                }
-            })
-        except Exception:
-            logging.exception("[WebSocketClient] on_wpp_ack error")
-
-    def _normalize_wpp_message(self, wpp_msg):
-        msg_id = wpp_msg.get("id")
-        if isinstance(msg_id, dict):
-            msg_id = msg_id.get("_serialized", "")
-        elif not isinstance(msg_id, str):
-            msg_id = ""
-
-        parts = msg_id.split("_") if msg_id else []
-        clean_id = parts[2] if len(parts) > 2 else (parts[-1] if parts else msg_id)
-
-        from_jid = wpp_msg.get("from", "")
-        to_jid = wpp_msg.get("to", "")
-
-        # Safely parse fromMe supporting boolean, string representation, or ID prefix fallback
-        from_me_val = wpp_msg.get("fromMe")
-        if from_me_val is not None:
-            if isinstance(from_me_val, bool):
-                from_me = from_me_val
-            else:
-                from_me = (str(from_me_val).lower() == "true")
-        else:
-            from_me = (parts[0] == "true") if parts else False
-
-        # Detect status/story messages: WPPConnect sends them with to="status@broadcast"
-        # or sets isStatus=True.  The real sender is in the "from" field.
-        is_status = "broadcast" in (to_jid or "") or wpp_msg.get("isStatus", False)
-
-        if is_status:
-            remote_jid = "status@broadcast"
-            status_participant = self._clean_jid(from_jid)
-        else:
-            key_remote = ""
-            wpp_id_obj = wpp_msg.get("id")
-            if isinstance(wpp_id_obj, dict):
-                key_remote = wpp_id_obj.get("remote", "")
-            if not key_remote and len(parts) > 1:
-                key_remote = parts[1]
-
-            if key_remote:
-                remote_jid = self._clean_jid(key_remote)
-            else:
-                remote_jid = self._clean_jid(to_jid if from_me else from_jid)
-            status_participant = ""
-
-        ts = wpp_msg.get("timestamp") or wpp_msg.get("t", int(time.time()))
-        if ts > 1_000_000_000_000:
-            ts //= 1000
-
-        msg_type = wpp_msg.get("type", "chat")
-        conversation = wpp_msg.get("body", "") or wpp_msg.get("text", "")
-
-        def _safe_media_key(val):
-            if not val:
-                return ""
-            if isinstance(val, (bytes, bytearray)):
-                import base64
-                return base64.b64encode(val).decode("utf-8")
-            if isinstance(val, dict) and "data" in val:
-                return val
-            if isinstance(val, str):
-                return val
-            return ""
-
-        message_content = {}
-        if msg_type == "chat":
-            message_content = {"conversation": conversation}
-        elif msg_type == "extendedText":
-            message_content = {
-                "extendedTextMessage": {
-                    "text": conversation
-                }
-            }
-        elif msg_type in ("audio", "ptt"):
-            dur = wpp_msg.get("duration") or wpp_msg.get("seconds")
-            if not dur and isinstance(wpp_msg.get("mediaData"), dict):
-                dur = wpp_msg.get("mediaData", {}).get("duration")
-            try:
-                seconds_val = int(float(dur)) if dur else 0
-            except Exception:
-                seconds_val = 0
-            message_content = {
-                "audioMessage": {
-                    "url": wpp_msg.get("clientUrl", ""),
-                    "seconds": seconds_val,
-                    "mediaKey": _safe_media_key(wpp_msg.get("mediaKey")),
-                    "directPath": wpp_msg.get("directPath", "")
-                }
-            }
-        elif msg_type == "image":
-            # NOTE: do NOT fall back to wpp_msg["body"] for the caption — for
-            # media messages WPPConnect puts the base64 JPEG thumbnail in `body`,
-            # which then showed up as raw base64 instead of the caption.
-            img_caption = wpp_msg.get("caption", "") or ""
-            if looks_like_binary_blob(img_caption):
-                img_caption = ""
-            message_content = {
-                "imageMessage": {
-                    "caption": img_caption,
-                    "url": wpp_msg.get("clientUrl", ""),
-                    "mimetype": wpp_msg.get("mimetype", "image/jpeg"),
-                    "mediaKey": _safe_media_key(wpp_msg.get("mediaKey")),
-                    "directPath": wpp_msg.get("directPath", "")
-                }
-            }
-        elif msg_type == "video":
-            dur = wpp_msg.get("duration") or wpp_msg.get("seconds")
-            if not dur and isinstance(wpp_msg.get("mediaData"), dict):
-                dur = wpp_msg.get("mediaData", {}).get("duration")
-            try:
-                seconds_val = int(float(dur)) if dur else 0
-            except Exception:
-                seconds_val = 0
-            vid_caption = wpp_msg.get("caption", "") or ""
-            if looks_like_binary_blob(vid_caption):
-                vid_caption = ""
-            message_content = {
-                "videoMessage": {
-                    "caption": vid_caption,
-                    "seconds": seconds_val,
-                    "gifPlayback": wpp_msg.get("isGif", False) or wpp_msg.get("gifPlayback", False),
-                    "url": wpp_msg.get("clientUrl", ""),
-                    "mimetype": wpp_msg.get("mimetype", "video/mp4"),
-                    "mediaKey": _safe_media_key(wpp_msg.get("mediaKey")),
-                    "directPath": wpp_msg.get("directPath", "")
-                }
-            }
-        elif msg_type == "document":
-            message_content = {
-                "documentMessage": {
-                    "fileName": wpp_msg.get("filename") or wpp_msg.get("fileName") or wpp_msg.get("title") or "Document",
-                    "fileLength": wpp_msg.get("size") or wpp_msg.get("fileLength") or 0,
-                    "url": wpp_msg.get("clientUrl", ""),
-                    "mimetype": wpp_msg.get("mimetype", ""),
-                    "mediaKey": _safe_media_key(wpp_msg.get("mediaKey")),
-                    "directPath": wpp_msg.get("directPath", "")
-                }
-            }
-        elif msg_type == "sticker":
-            message_content = {
-                "stickerMessage": {
-                    "url": wpp_msg.get("clientUrl", ""),
-                    "mimetype": wpp_msg.get("mimetype", "image/webp"),
-                    "mediaKey": _safe_media_key(wpp_msg.get("mediaKey")),
-                    "directPath": wpp_msg.get("directPath", "")
-                }
-            }
-        elif msg_type in ("location", "liveLocation"):
-            # main.py/conversations.py both already handle locationMessage /
-            # liveLocationMessage (rendered as a static "📍 Localização" bubble
-            # today, coordinates kept here for when that changes) — this type
-            # had no branch here at all, so a shared live location silently
-            # fell through with no message_content and no matching entry in
-            # type_mapping below, meaning it rendered as nothing.
-            loc_key = "liveLocationMessage" if msg_type == "liveLocation" else "locationMessage"
-            message_content = {
-                loc_key: {
-                    "degreesLatitude": wpp_msg.get("lat"),
-                    "degreesLongitude": wpp_msg.get("lng"),
-                    "name": wpp_msg.get("loc") or wpp_msg.get("body") or "",
-                }
-            }
-        elif msg_type == "vcard":
-            message_content = {
-                "contactMessage": {
-                    "displayName": wpp_msg.get("displayName") or wpp_msg.get("body") or "Contato",
-                }
-            }
-        elif msg_type == "pollCreation":
-            message_content = {
-                "pollCreationMessage": {
-                    "name": wpp_msg.get("pollName") or wpp_msg.get("body") or ""
-                }
-            }
-        elif msg_type == "buttons":
-            message_content = {
-                "buttonsMessage": {}
-            }
-        elif msg_type == "list":
-            message_content = {
-                "listMessage": {}
-            }
-        elif msg_type == "template":
-            message_content = {
-                "templateMessage": {}
-            }
-        elif msg_type == "revoked":
-            message_content = {
-                "protocolMessage": {
-                    "type": 3
-                }
-            }
-        elif msg_type == "gp2":
-            # Group membership/settings notifications (join, leave, removed,
-            # promoted, subject/description/picture change, …). WPPConnect
-            # carries the specific action in "subtype" and the affected
-            # participants in "recipients".
-            sender_obj = wpp_msg.get("sender")
-            author_raw = wpp_msg.get("author") or (
-                sender_obj.get("id", "") if isinstance(sender_obj, dict) else ""
-            )
-            # "recipients" entries can be raw JID strings or WPPConnect Wid
-            # objects ({"server":..., "user":..., "_serialized":...}) — always
-            # normalize to plain strings here so downstream UI code (which
-            # expects to call string methods like .endswith() on each one)
-            # never has to guard against a dict slipping through.
-            raw_recipients = wpp_msg.get("recipients") or []
-            clean_recipients = [
-                self._clean_jid(r) for r in raw_recipients if self._clean_jid(r)
-            ]
-            # "body" carries the payload of the change — the new group name for
-            # a subject change, the new description for a description change,
-            # or the on/off value for a settings change. Dropping it (as this
-            # did) is why those events could only be rendered as a vague
-            # "group update" with no indication of what was actually changed.
-            message_content = {
-                "groupNotification": {
-                    "subtype": wpp_msg.get("subtype", ""),
-                    "recipients": clean_recipients,
-                    "author": self._clean_jid(author_raw) if author_raw else "",
-                    "body": wpp_msg.get("body") or wpp_msg.get("subject") or "",
-                    "value": wpp_msg.get("value"),
-                }
-            }
-
-        # Fallback to plain text if the message type is unsupported/unmapped but contains body text
-        if not message_content and conversation:
-            msg_type = "chat"
-            message_content = {"conversation": conversation}
-
-        type_mapping = {
-            "chat": "conversation",
-            "audio": "audioMessage",
-            "ptt": "audioMessage",
-            "image": "imageMessage",
-            "video": "videoMessage",
-            "document": "documentMessage",
-            "sticker": "stickerMessage",
-            "vcard": "contactMessage",
-            "pollCreation": "pollCreationMessage",
-            "buttons": "buttonsMessage",
-            "list": "listMessage",
-            "template": "templateMessage",
-            "revoked": "protocolMessage",
-            "extendedText": "extendedTextMessage",
-            "gp2": "groupNotification",
-            "location": "locationMessage",
-            "liveLocation": "liveLocationMessage",
-        }
-        mapped_type = type_mapping.get(msg_type, msg_type)
-
-        ack = wpp_msg.get("ack")
-        message_updates = []
-        if ack is not None:
-            # Same translation as on_wpp_ack — a negative ack here means the
-            # send failed and must not be passed through raw (it rendered as no
-            # status at all, indistinguishable from a message still in flight).
-            mapped_status = ack_to_status(ack)
-            if mapped_status is not None:
-                message_updates.append({"status": str(mapped_status)})
-
-        normalized = {
-            "key": {
-                "remoteJid": remote_jid,
-                "fromMe": from_me,
-                "id": clean_id
-            },
-            "pushName": wpp_msg.get("pushName") or (wpp_msg.get("sender") or {}).get("pushname") or wpp_msg.get("notifyName") or "",
-            "message": message_content,
-            "messageTimestamp": ts,
-            "messageType": mapped_type,
-            "MessageUpdate": message_updates
-        }
-
-        # Status messages: include the real sender as participant
-        if status_participant:
-            normalized["key"]["participant"] = status_participant
-
-        participant = (
-            wpp_msg.get("author")
-            or wpp_msg.get("participant")
-            or (wpp_msg.get("key") or {}).get("participant")
-            or (wpp_msg.get("sender") or {}).get("id")
-            or ""
-        )
-        if participant:
-            normalized["key"]["participant"] = self._clean_jid(participant)
-
-        quoted_msg = wpp_msg.get("quotedMsg")
-        quoted_msg_obj = wpp_msg.get("quotedMsgObj")
-        quoted_stanza_id = wpp_msg.get("quotedStanzaID") or wpp_msg.get("quotedStanzaId")
-        quoted_participant = wpp_msg.get("quotedParticipant")
-
-        # Fallback to WPPConnect/Baileys contextInfo if WPPConnect quote fields are missing
-        ctx_info = wpp_msg.get("contextInfo")
-        if not ctx_info and isinstance(wpp_msg.get("message"), dict):
-            sub_msg = wpp_msg.get("message")
-            for sub_key in ("extendedTextMessage", "imageMessage", "videoMessage", "audioMessage", "documentMessage"):
-                if isinstance(sub_msg.get(sub_key), dict):
-                    ctx_info = sub_msg[sub_key].get("contextInfo")
-                    if ctx_info:
-                        break
-        if isinstance(ctx_info, dict):
-            if not quoted_stanza_id:
-                quoted_stanza_id = ctx_info.get("stanzaId")
-            if not quoted_participant:
-                quoted_participant = ctx_info.get("participant")
-            if not quoted_msg:
-                quoted_msg = ctx_info.get("quotedMessage")
-
-        # Debug quotes
-        body_text = str(wpp_msg.get('body') or '').strip().lower()
-        if body_text in ('..', 'oi'):
-            logging.info(f"[Raw Message Debug] Message {wpp_msg.get('id')} body: {body_text}. Full payload: {wpp_msg}")
-
-        # Determine if there is any quoted context
-        has_quote = False
-        clean_quoted_id = ""
-        participant_jid = ""
-        quoted_body = ""
-
-        # 1. Start with the top-level keys which are the most reliable in WPPConnect
-        if quoted_stanza_id:
-            has_quote = True
-            clean_quoted_id = quoted_stanza_id
-            if isinstance(clean_quoted_id, str) and "_" in clean_quoted_id:
-                parts = clean_quoted_id.split("_")
-                clean_quoted_id = parts[2] if len(parts) > 2 else parts[-1]
-
-        if quoted_participant:
-            has_quote = True
-            participant_jid = self._clean_jid(quoted_participant)
-
-        # 2. Extract content from quotedMsg (dictionary or string)
-        if isinstance(quoted_msg, dict):
-            has_quote = True
-            if not quoted_body:
-                quoted_body = (
-                    quoted_msg.get("body")
-                    or quoted_msg.get("caption")
-                    or quoted_msg.get("conversation")
-                    or (quoted_msg.get("extendedTextMessage") or {}).get("text")
-                    or ""
-                )
-            
-            # Fallbacks if top-level fields were missing
-            if not clean_quoted_id:
-                quoted_id = quoted_msg.get("id")
-                if isinstance(quoted_id, dict):
-                    quoted_id = quoted_id.get("_serialized", "")
-                if quoted_id:
-                    parts = quoted_id.split("_")
-                    clean_quoted_id = parts[2] if len(parts) > 2 else parts[-1]
-            
-            if not participant_jid:
-                author = quoted_msg.get("author") or (quoted_msg.get("sender") or {}).get("id") or ""
-                if author:
-                    # author (and .sender.id) can be a raw WPPConnect Wid
-                    # object ({"server":..., "user":..., "_serialized":...})
-                    # rather than a plain string — the sibling quotedMsgObj
-                    # branch below already accounts for this via _clean_jid();
-                    # calling .replace() directly here raised AttributeError,
-                    # which _normalize_wpp_message's only caller swallows with
-                    # a bare `except Exception: print(...)` — silently
-                    # dropping the entire live message, not just its quote.
-                    participant_jid = self._clean_jid(author)
-
-        elif isinstance(quoted_msg, str) and quoted_msg:
-            has_quote = True
-            if not clean_quoted_id:
-                clean_quoted_id = quoted_msg
-                if "_" in clean_quoted_id:
-                    parts = clean_quoted_id.split("_")
-                    clean_quoted_id = parts[2] if len(parts) > 2 else parts[-1]
-
-        # 3. Extract content from quotedMsgObj (alternative dictionary)
-        if isinstance(quoted_msg_obj, dict):
-            has_quote = True
-            if not quoted_body:
-                quoted_body = (
-                    quoted_msg_obj.get("body")
-                    or quoted_msg_obj.get("caption")
-                    or quoted_msg_obj.get("conversation")
-                    or (quoted_msg_obj.get("extendedTextMessage") or {}).get("text")
-                    or ""
-                )
-            
-            if not clean_quoted_id:
-                quoted_id = quoted_msg_obj.get("id")
-                if isinstance(quoted_id, dict):
-                    quoted_id = quoted_id.get("_serialized", "")
-                if quoted_id:
-                    parts = quoted_id.split("_")
-                    clean_quoted_id = parts[2] if len(parts) > 2 else parts[-1]
-            
-            if not participant_jid:
-                author = quoted_msg_obj.get("author") or (quoted_msg_obj.get("sender") or {}).get("id") or ""
-                if author:
-                    participant_jid = self._clean_jid(author)
-
-        wpp_mentioned = wpp_msg.get("mentionedJidList") or []
-        mentioned_jids = [
-            self._clean_jid(m)
-            for m in wpp_mentioned
-            if m
-        ]
-
-        if has_quote or mentioned_jids:
-            # Store only a slim quoted preview — never the full quoted message,
-            # whose thumbnail/mediaKey/directPath/hashes bloat messages.dat and
-            # slow conversation loading without ever being read by the UI.
-            if isinstance(quoted_msg, dict):
-                quoted_msg_payload = _slim_quoted_message(quoted_msg)
-            else:
-                quoted_msg_payload = {"conversation": (quoted_body or "")[:300]}
-            context_info = {}
-            if has_quote:
-                context_info["stanzaId"] = clean_quoted_id
-                context_info["participant"] = participant_jid
-                context_info["quotedMessage"] = quoted_msg_payload
-            if mentioned_jids:
-                context_info["mentionedJid"] = mentioned_jids
-            
-            # If msg_type is conversation, promote it to extendedTextMessage
-            if mapped_type == "conversation":
-                mapped_type = "extendedTextMessage"
-                normalized["messageType"] = "extendedTextMessage"
-                normalized["message"] = {
-                    "extendedTextMessage": {
-                        "text": conversation,
-                        "contextInfo": context_info
-                    }
-                }
-            else:
-                # Put under specific sub-keys (e.g. imageMessage, videoMessage) if they exist
-                for sub_key in (
-                    "extendedTextMessage", "imageMessage", "videoMessage", "audioMessage",
-                    "documentMessage", "stickerMessage", "locationMessage", "contactMessage"
-                ):
-                    if sub_key in normalized["message"] and isinstance(normalized["message"][sub_key], dict):
-                        normalized["message"][sub_key]["contextInfo"] = context_info
-
-        return normalized
