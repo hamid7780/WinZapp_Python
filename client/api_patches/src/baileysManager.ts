@@ -87,6 +87,7 @@ export class BaileysManager {
   private tokensDir: string;
   private messageCache: Map<string, WAMessage> = new Map();
   private lidToPhoneMap: Map<string, string> = new Map();
+  private syncTimers: Map<string, NodeJS.Timeout> = new Map();
 
   constructor(io: SocketIOServer) {
     this.io = io;
@@ -472,9 +473,15 @@ export class BaileysManager {
         let index = 0;
         const processBatch = () => {
           if (index >= messages.length) {
-            if (isLatest === true || isLatest === undefined) {
-              this.io.emit('messages.set', { session });
+            // Debounce messages.set
+            const existingTimer = this.syncTimers.get(session);
+            if (existingTimer) {
+              clearTimeout(existingTimer);
             }
+            this.syncTimers.set(session, setTimeout(() => {
+              this.io.emit('messages.set', { session });
+              this.syncTimers.delete(session);
+            }, 2000));
             return;
           }
           const batch = messages.slice(index, index + batchSize);
@@ -501,9 +508,15 @@ export class BaileysManager {
         };
         processBatch();
       } else {
-        if (isLatest === true || isLatest === undefined) {
-          this.io.emit('messages.set', { session });
+        // Debounce messages.set
+        const existingTimer = this.syncTimers.get(session);
+        if (existingTimer) {
+          clearTimeout(existingTimer);
         }
+        this.syncTimers.set(session, setTimeout(() => {
+          this.io.emit('messages.set', { session });
+          this.syncTimers.delete(session);
+        }, 2000));
       }
     });
 
@@ -1114,7 +1127,9 @@ export class BaileysManager {
       pushName,
       message: realMessage,
       messageType,
-      messageTimestamp: msg.messageTimestamp ? toNumber(msg.messageTimestamp) : Math.floor(Date.now() / 1000)
+      messageTimestamp: msg.messageTimestamp ? toNumber(msg.messageTimestamp) : Math.floor(Date.now() / 1000),
+      broadcast: msg.broadcast || msg.isBroadcast || false,
+      isBroadcast: msg.isBroadcast || false
     };
   }
 

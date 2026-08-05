@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-WinZapp is a free, self-hosted Windows desktop WhatsApp client built specifically for **accessibility** (blind/low-vision users via NVDA/JAWS/Narrator through `accessible_output2`). It's a hybrid app: a Python 3.13 + wxPython GUI process drives a locally-run **WPPConnect Server** (Node.js, cloned/built from the upstream `wppconnect-team/wppconnect-server` repo) that acts as the actual WhatsApp Web gateway. The two processes talk over local HTTP REST (`http://127.0.0.1:6300/api/...`) and Socket.IO (real-time events).
+WinZapp is a free, self-hosted Windows desktop WhatsApp client built specifically for **accessibility** (blind/low-vision users via NVDA/JAWS/Narrator through `accessible_output2`). It's a hybrid app: a Python 3.13 + wxPython GUI process drives a locally-run **Baileys Gateway Server** (Node.js, built from `client/api_patches/`) that acts as the actual WhatsApp Web gateway using the `@whiskeysockets/baileys` library (direct WhatsApp Web protocol, no browser). The two processes talk over local HTTP REST (`http://127.0.0.1:6300/api/...`) and Socket.IO (real-time events).
 
 ## Commands
 
@@ -14,16 +14,16 @@ python -m venv venv
 .\venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 pip install -r requirements-dev.txt   # adds pytest, pytest-cov, pytest-asyncio
-python setup_api.py                   # clones + builds client/api/ (WPPConnect Server) — one-time, requires Node
+python setup_api.py                   # sets up client/api/ (Baileys Gateway Server) — one-time, requires Node
 ```
-`setup_api.py` clones WPPConnect Server into `client/api/`, restores WinZapp's custom patched files (`start.js`, `package.json`, `config.json`, a handful of `src/**/*.ts` controllers), then runs `npm install` and `npm run build` inside `client/api/`. Re-run it any time `client/api/` needs to be rebuilt — it preserves `node_modules` and the custom files across re-clones.
+`setup_api.py` copies the Baileys Gateway files from `client/api_patches/` into `client/api/`, runs `npm install` and `npm run build` inside it. The gateway source lives in `client/api_patches/src/` (TypeScript: `baileysManager.ts`, `routes.ts`, `server.ts`, `types.ts`) and the built output goes to `client/api/dist/`. Re-run it any time the gateway code changes.
 
 ### Run the client in dev mode
 ```powershell
 cd client
 python main.py
 ```
-Entry point is `client/main.py`, guarded by `if __name__ == "__main__":` near the bottom of the file. There is no separate "start the API server" dev command — `main.py` launches/manages the local Node WPPConnect Server process itself.
+Entry point is `client/main.py`, guarded by `if __name__ == "__main__":` near the bottom of the file. There is no separate "start the API server" dev command — `main.py` launches/manages the local Node Baileys Gateway Server process itself.
 
 ### Tests
 ```powershell
@@ -44,16 +44,17 @@ Requires, in addition to the venv: `client/node/` (portable Windows x64 Node.js 
 
 ### Two-process split
 - **`client/` (Python/wxPython)** — all UI, business logic, local persistence, notifications, sounds. This is what you'll be editing almost all of the time.
-- **`client/api/` (Node/TypeScript, vendored via `setup_api.py`, not committed)** — WPPConnect Server, a Puppeteer-driven WhatsApp Web automation server. WinZapp keeps a small set of patched files on top of upstream (`start.js`, `package.json`, `config.json`, a few `src/**/*.ts` controllers) — `setup_api.py` re-applies these after every clone/checkout. Treat this directory as mostly third-party; only touch the specific patched files WinZapp owns.
-- `client/api2/` is a small standalone Puppeteer/Chrome auto-install helper script, unrelated to the main WPPConnect flow above.
+- **`client/api_patches/` (Node/TypeScript, committed)** — WinZapp's own Baileys Gateway Server source code. Key files: `src/baileysManager.ts` (session management, message routing, Baileys socket lifecycle), `src/routes.ts` (HTTP REST endpoints), `src/server.ts` (Express + Socket.IO server), `src/types.ts` (TypeScript interfaces). `setup_api.py` copies these into `client/api/` and builds them.
+- **`client/api/` (Node, built output, not committed)** — the built Baileys Gateway. Contains `dist/server.js`, `dist/baileysManager.js`, `dist/routes.js` plus `node_modules/`. Created by `setup_api.py`.
+- `client/api2/` is a small standalone helper script, currently unused after the Baileys migration.
 
 ### `client/main.py` — the god object
 Almost everything (WebSocket/HTTP calls to WPPConnect, JID normalization, chat/contact state, sync, sound/notification dispatch, menu wiring, update checks) lives on the single `MainWindow(wx.Frame)` class in `client/main.py` (~11,700 lines). When making a change, `grep` this file first — the method you need very likely already exists here rather than in a smaller module.
 
 ### Message/data pipeline
-1. **`client/core/websocket_client.py`** (`WebSocketClient`) connects to WPPConnect's Socket.IO and normalizes raw WPPConnect/Baileys event payloads into WinZapp's canonical message dict shape: `{"key": {"remoteJid", "fromMe", "id", "participant"?}, "message": {...}, "messageType": "...", "messageTimestamp": ..., "pushName": "..."}`. All downstream code (`main.py`, `core/database.py`, `ui/conversations.py`) assumes this shape.
+1. **`client/core/websocket_client.py`** (`WebSocketClient`) connects to the Baileys Gateway's Socket.IO and normalizes raw Baileys event payloads into WinZapp's canonical message dict shape: `{"key": {"remoteJid", "fromMe", "id", "participant"?}, "message": {...}, "messageType": "...", "messageTimestamp": ..., "pushName": "..."}`. All downstream code (`main.py`, `core/database.py`, `ui/conversations.py`) assumes this shape.
 2. **`MainWindow.on_new_message()`** (live messages) and **`on_historical_message()`** (history-sync backfill) in `main.py` are the two funnels every incoming/echoed message passes through: they resolve `@lid`↔phone duplicates, match echoes of our own sends against locally-registered "pending" virtual messages, update in-memory `self.chats`, and schedule a debounced persist. Both — plus `_extract_lid_mapping()`, which `WebSocketClient.on_messages_upsert()` also calls directly on the Socket.IO thread, bypassing the other two entirely — are gated by `MainWindow._live_events_ready()`: a reused pairing WebSocket can start delivering events before `prepare_sync()` has created `self.db`, or before the initial sync has actually started, and processing a message that early either crashes (attribute doesn't exist yet) or lets a live event sneak a chat into the list ahead of the sync about to fetch the authoritative state. `is_countable_message()` (module-level in `main.py`) further excludes WhatsApp/WPPConnect system events (`groupNotification`, `protocolMessage` — group join/leave, settings changes, revokes) from ever bumping a chat's sort position, incrementing its unread badge, or firing a notification; they're still stored and shown as a timeline entry when the conversation is opened.
-3. **Outgoing sends**: UI code in `client/ui/conversations.py` builds a "virtual" pending message dict (`_local_pending: True`, `_local_id: <uuid4>`) shown immediately in the UI, and hands it to **`client/core/message_queue.py`**'s `MessageQueue` (one background thread). The queue calls the matching `send_*` method on `MainWindow` (`send_text_message`, `send_audio_message`, `send_media_attachment`, `send_contact_attachment`), which POSTs to a WPPConnect REST endpoint and returns the real WhatsApp message ID. A send failure is classified before it's retried: an explicit "Disconnected" response leaves the message queued untouched, a timeout/dropped connection is treated as *ambiguous* (WhatsApp Web may have accepted it into its own outbox already) and is handed off without a resend, and only a definite server-side failure retries — at most 4 times. This exists because retrying an ambiguous failure used to duplicate real sends when connectivity flapped. Separately, the *same* sent message also arrives back through the WebSocket echo path (`on_new_message`, `from_me=True`) — since WPPConnect gives no client-side correlation ID on that echo, it's matched against pending virtual messages **by message type** (text/audio/image/etc.), not by content. Be careful here: matching the wrong pending message swaps real WhatsApp IDs between unrelated messages (wrong status, wrong audio file playback).
+3. **Outgoing sends**: UI code in `client/ui/conversations.py` builds a "virtual" pending message dict (`_local_pending: True`, `_local_id: <uuid4>`) shown immediately in the UI, and hands it to **`client/core/message_queue.py`**'s `MessageQueue` (one background thread). The queue calls the matching `send_*` method on `MainWindow` (`send_text_message`, `send_audio_message`, `send_media_attachment`, `send_contact_attachment`), which POSTs to a Baileys Gateway REST endpoint and returns the real WhatsApp message ID. A send failure is classified before it's retried: an explicit "Disconnected" response leaves the message queued untouched, a timeout/dropped connection is treated as *ambiguous* (Baileys may have accepted it into its own outbox already) and is handed off without a resend, and only a definite server-side failure retries — at most 4 times. This exists because retrying an ambiguous failure used to duplicate real sends when connectivity flapped. Separately, the *same* sent message also arrives back through the WebSocket echo path (`on_new_message`, `from_me=True`) — since the gateway gives no client-side correlation ID on that echo, it's matched against pending virtual messages **by message type** (text/audio/image/etc.), not by content. Be careful here: matching the wrong pending message swaps real WhatsApp IDs between unrelated messages (wrong status, wrong audio file playback).
 4. **`client/core/database.py`** (`DatabaseManager`) is a fully async `aiosqlite` layer — single serialized connection, WAL mode, per-write `asyncio.Lock`. Indexed columns (`jid`, `timestamp`) are plaintext; payload columns (`message_json`, `last_message_json`) are Fernet-encrypted with a per-install key (`data/secret.key`). Storage is SQLite-only (`messages.db`) — there is no `messages.dat` fallback or migration path any more; that legacy format was retired.
 5. **`client/core/database_bridge.py`** (`DatabaseBridge`) is the sync façade `main.py` actually calls: it runs a dedicated background asyncio event loop in its own thread and dispatches every `DatabaseManager` call via `asyncio.run_coroutine_threadsafe(...).result(timeout=...)`, blocking the calling (wx/worker) thread until the call finishes or the timeout elapses. This exists because wx and the rest of the app are synchronous/thread-based, but the DB layer is async. The timeout (and `close()` refusing new calls / waiting briefly for in-flight ones to drain before stopping the loop) exist specifically to keep a stuck coroutine from freezing the whole app forever — that used to be the most commonly reported "WinZapp stopped responding" symptom.
 
@@ -83,7 +84,34 @@ The WPPConnect session token is Fernet-encrypted with the same per-install key t
 This is the app's core differentiator, not an afterthought: UI is built from plain wx controls (`wx.ListCtrl`, `wx.TextCtrl`, standard menus/dialogs) specifically because screen readers can read them reliably — avoid custom-drawn/owner-drawn controls. Batch list mutations inside `Freeze()`/`Thaw()` so screen readers get one accessibility event instead of a flood. Dialog titles and list items must resolve human-readable names (contact/group name) rather than raw JIDs — NVDA will otherwise read out raw phone-number/JID digits.
 
 ### Auto-updater (`client/updater.py`)
-`UpdateChecker` polls the GitHub Releases API (repo from `config.GITHUB_REPO`), compares `version.__version__` against the latest tag, and on acceptance downloads the release's ZIP asset, extracts it, and hands off to a generated `.bat` script that waits for the current process to exit, kills stray WPPConnect/Postgres processes on ports 6300/5433, copies files over the install dir, and relaunches — because Windows won't let a running process overwrite its own files.
+`UpdateChecker` polls the GitHub Releases API (repo from `config.GITHUB_REPO`), compares `version.__version__` against the latest tag, and on acceptance downloads the release's ZIP asset, extracts it, and hands off to a generated `.bat` script that waits for the current process to exit, kills stray Node/Baileys processes on ports 6300/5433, copies files over the install dir, and relaunches — because Windows won't let a running process overwrite its own files.
 
 ### Packaging (`build.py`, `installer/`)
 `build.py` runs PyInstaller (via CLI args with `--collect-all`, not the checked-in `client/WinZapp.spec`, which is stale/unused) to compile `client/main.py`, then for onedir builds also compiles the C installer/uninstaller stubs in `installer/` (gcc + windres), zips the staged app as a `ZIP_STORED` payload, and appends it to the installer stub to produce a single self-extracting `dist/WinZappInstaller.exe`, plus a plain `dist/WinZapp.zip` portable build. `client/api/` and `client/node/` are excluded from git and must exist on disk before running it.
+
+## Important: Baileys migration (formerly Puppeteer/WPPConnect)
+
+The project has fully migrated from WPPConnect Server (Puppeteer-driven, using a headless Chrome browser) to a custom **Baileys Gateway Server** that connects directly to WhatsApp's WebSocket protocol without any browser. Key differences:
+- **No Chrome/Puppeteer**: There is no browser process. Baileys uses `@whiskeysockets/baileys` to speak WhatsApp's protocol directly over a WebSocket.
+- **Session management**: Baileys uses `useMultiFileAuthState` for session persistence (files in a session directory), not Chrome's IndexedDB/LevelDB profile.
+- **Failure modes are different**: There are no "detached Frame" crashes, no "browserClose" events, no Puppeteer page deaths. Connection issues manifest as Baileys WebSocket disconnects, which Baileys handles with its own reconnection logic.
+- **Many Python-side comments and methods still reference Puppeteer/Chrome**: These are stale and documented in `bugs.md`. Do not trust comments that describe Chrome/Puppeteer crash recovery — they describe a system that no longer exists.
+
+## Project Documentation Rules
+
+### Bug Tracking — `bugs.md`
+- All bugs found during any code scan, testing, or user report must be documented in `bugs.md` at the project root.
+- Each bug has a unique ID (BUG-XXXX), severity (SEVERE/HIGH/MEDIUM/LOW/ULTRA LOW/COSMETIC), and status.
+- When fixing a bug, write "Fix Notes" under the bug entry describing which files were changed, what line numbers were affected, and what was done. Do not include code snippets — just line numbers and a description.
+- After writing fix notes, set the status to "FIXED — User Verification Required". The bug stays in this state until the user explicitly confirms the fix works. Only then does it move to "VERIFIED".
+- This workflow means: no bug is considered completely fixed until the user says so.
+
+### Rewrite Candidates — `rewrites.md`
+- Systems that need complete rewrites are documented in `rewrites.md` at the project root.
+- Written in plain sentences, not tables. Each entry explains what the system does, why it needs a rewrite, what a better design looks like, and what risks the rewrite carries.
+- When a system is rewritten, update its entry in `rewrites.md` to reflect the new state.
+
+### Project Understanding First
+- Before making any changes, read deeply into the affected files and understand the existing architecture.
+- The project is complex (main.py is ~14,000 lines, conversations.py is ~417KB). Do not assume anything — grep and read first.
+- The codebase has four concurrent threads touching MainWindow attributes: the wx main thread, the Socket.IO background thread, the asyncio database thread, and the message queue worker thread. Thread safety is critical.

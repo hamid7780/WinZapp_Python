@@ -6404,6 +6404,13 @@ class MainWindow(wx.Frame):
 
                     # Skip status@broadcast — statuses are shown in the Status tab
                     if not jid or jid.endswith("@broadcast"):
+                        if jid in chats:
+                            del chats[jid]
+                            try:
+                                if hasattr(self, "db") and self.db is not None:
+                                    self.db.delete_chat(jid)
+                            except Exception:
+                                pass
                         continue
 
                     # Populate/update self.contacts from chat name metadata
@@ -6487,6 +6494,13 @@ class MainWindow(wx.Frame):
                             or bool(chat.get("unreadCount"))
                         )
                         if not has_activity:
+                            if jid in chats:
+                                del chats[jid]
+                                try:
+                                    if hasattr(self, "db") and self.db is not None:
+                                        self.db.delete_chat(jid)
+                                except Exception:
+                                    pass
                             continue
                     if jid not in chats:
                         if "messages" not in chat:
@@ -6643,8 +6657,8 @@ class MainWindow(wx.Frame):
                     # pin field until it has one) must NOT be silently unpinned
                     # by this poll — that would undo a pin the user set seconds
                     # ago. Only an explicit server value can change pin state.
-                    pin_present = "pin" in chat
-                    pin_val = chat.get("pin")
+                    pin_present = "pin" in chat or "pinned" in chat
+                    pin_val = chat.get("pin") if "pin" in chat else chat.get("pinned")
                     if isinstance(pin_val, str):
                         if pin_val.lower() == "true":
                             pin_val = True
