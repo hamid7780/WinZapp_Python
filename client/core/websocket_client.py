@@ -674,9 +674,30 @@ class WebSocketClient:
         # treating them as live new messages would append them at the bottom
         # of the conversation as if they had just been sent — dispatch them
         # to the historical handler to be saved silently instead.
+<<<<<<< HEAD
         if msg.get("isMdHistoryMsg"):
             wx.CallAfter(self.main_window.on_historical_message, msg)
             return
+=======
+        #
+        # BUT: this assumption only holds for a chat that hasn't been synced
+        # yet (not present in self.chats). Once a chat is already in the
+        # list, WPPConnect can still tag a genuinely new, real-time message
+        # with isMdHistoryMsg=True (observed in practice) — silently routing
+        # it to on_historical_message would save it without a notification,
+        # sound, or unread-count bump, effectively "losing" it from the
+        # user's point of view. So: only take the silent path for chats not
+        # yet in the list; an already-listed chat always gets full live
+        # treatment regardless of the flag.
+        if msg.get("isMdHistoryMsg"):
+            key = msg.get("key", {})
+            remote_jid = self.main_window._normalize_jid(key.get("remoteJid", ""))
+            if remote_jid not in self.main_window.chats:
+                wx.CallAfter(self.main_window.on_historical_message, msg)
+                return
+            # Chat already known/synced — fall through to live handling below.
+
+>>>>>>> 3e2a1e951e8c54963eee4f207270f69869a9097f
         # Extract JID mapping from WebSocket message
         self.main_window._extract_lid_mapping(msg)
         # fromMe=True can mean two things:

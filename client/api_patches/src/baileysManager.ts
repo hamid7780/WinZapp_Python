@@ -473,6 +473,7 @@ export class BaileysManager {
         let index = 0;
         const processBatch = () => {
           if (index >= messages.length) {
+<<<<<<< HEAD
             // Debounce messages.set
             const existingTimer = this.syncTimers.get(session);
             if (existingTimer) {
@@ -482,6 +483,11 @@ export class BaileysManager {
               this.io.emit('messages.set', { session });
               this.syncTimers.delete(session);
             }, 2000));
+=======
+            if (isLatest === true || isLatest === undefined) {
+              this.io.emit('messages.set', { session });
+            }
+>>>>>>> 3e2a1e951e8c54963eee4f207270f69869a9097f
             return;
           }
           const batch = messages.slice(index, index + batchSize);
@@ -508,6 +514,7 @@ export class BaileysManager {
         };
         processBatch();
       } else {
+<<<<<<< HEAD
         // Debounce messages.set
         const existingTimer = this.syncTimers.get(session);
         if (existingTimer) {
@@ -517,6 +524,11 @@ export class BaileysManager {
           this.io.emit('messages.set', { session });
           this.syncTimers.delete(session);
         }, 2000));
+=======
+        if (isLatest === true || isLatest === undefined) {
+          this.io.emit('messages.set', { session });
+        }
+>>>>>>> 3e2a1e951e8c54963eee4f207270f69869a9097f
       }
     });
 

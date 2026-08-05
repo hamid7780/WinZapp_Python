@@ -6657,8 +6657,13 @@ class MainWindow(wx.Frame):
                     # pin field until it has one) must NOT be silently unpinned
                     # by this poll — that would undo a pin the user set seconds
                     # ago. Only an explicit server value can change pin state.
+<<<<<<< HEAD
                     pin_present = "pin" in chat or "pinned" in chat
                     pin_val = chat.get("pin") if "pin" in chat else chat.get("pinned")
+=======
+                    pin_present = "pin" in chat
+                    pin_val = chat.get("pin")
+>>>>>>> 3e2a1e951e8c54963eee4f207270f69869a9097f
                     if isinstance(pin_val, str):
                         if pin_val.lower() == "true":
                             pin_val = True
